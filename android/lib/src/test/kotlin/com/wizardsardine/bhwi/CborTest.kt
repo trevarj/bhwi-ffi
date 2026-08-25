@@ -83,7 +83,7 @@ class CborTest {
     fun `structurally invalid cbor is rejected outright`() {
         // Reserved additional information, and indefinite lengths where they are illegal.
         for (hex in listOf("1c", "1f", "3f", "df")) {
-            assertFailsWith<Cbor.MalformedException>("expected malformed: $hex") {
+            assertFailsWith<TransportException.Io>("expected malformed: $hex") {
                 Cbor.isComplete(hex.unhex())
             }
         }

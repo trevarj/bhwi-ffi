@@ -13,7 +13,9 @@ internal object Cbor {
     const val INCOMPLETE = -1
 
     /** Structurally invalid CBOR — reading more bytes cannot fix it. */
-    class MalformedException(message: String) : TransportException("jade: malformed CBOR, $message")
+    @Suppress("NOTHING_TO_INLINE")
+    private inline fun malformed(message: String): Nothing =
+        throw TransportException.Io("jade: malformed CBOR, $message")
 
     /** Whether [buf] starts with one complete CBOR value. */
     fun isComplete(buf: ByteArray): Boolean = endOfValue(buf, 0, buf.size) != INCOMPLETE
@@ -42,9 +44,9 @@ internal object Cbor {
                 // Both end at a break, and both are only legal for these major types.
                 2, 3 -> endOfChunks(buf, pos, end, major)
                 4, 5 -> endOfItems(buf, pos, end)
-                else -> throw MalformedException("indefinite length for major type $major")
+                else -> malformed("indefinite length for major type $major")
             }
-            else -> throw MalformedException("reserved additional information $info")
+            else -> malformed("reserved additional information $info")
         }
 
         // For the length-carrying major types, every remaining byte or item needs at least
@@ -72,8 +74,8 @@ internal object Cbor {
             if (pos >= end) return INCOMPLETE
             val initial = buf[pos].toInt() and 0xff
             if (initial == BREAK) return pos + 1
-            if ((initial shr 5) != major) throw MalformedException("chunk of the wrong major type")
-            if ((initial and 0x1f) == 31) throw MalformedException("nested indefinite string")
+            if ((initial shr 5) != major) malformed("chunk of the wrong major type")
+            if ((initial and 0x1f) == 31) malformed("nested indefinite string")
             pos = endOfValue(buf, pos, end)
             if (pos == INCOMPLETE) return INCOMPLETE
         }
