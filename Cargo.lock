@@ -200,7 +200,6 @@ dependencies = [
  "bhwi-async",
  "futures",
  "hex",
- "log",
  "rand_core",
  "serde_json",
  "thiserror 1.0.69",

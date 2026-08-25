@@ -7,7 +7,7 @@ use bhwi::bitcoin::secp256k1::Secp256k1;
 use bhwi::bitcoin::{Address, Amount, NetworkKind, TxOut};
 use bhwi::miniscript::{Descriptor, DescriptorPublicKey};
 
-use crate::session::decode_psbt;
+use crate::types::decode_psbt;
 use crate::{AddressFormat, HwiError, Network};
 
 /// Upper bound on a single `derive_addresses` call.
@@ -293,7 +293,7 @@ mod tests {
             value: Amount::from_sat(10_000),
             script_pubkey: script,
         });
-        crate::session::encode_psbt(&psbt)
+        crate::types::encode_psbt(&psbt)
     }
 
     #[test]

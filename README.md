@@ -1,61 +1,62 @@
 # bhwi-ffi
 
 Experimental Android bindings for [BHWI](https://github.com/wizardsardine/bhwi)
-(`wizardsardine/bhwi` issue #1). The crate exposes `bhwi-async`'s hardware-wallet
-interface to Kotlin through [UniFFI](https://mozilla.github.io/uniffi-rs/), and the
-Gradle project here packages it as an AAR (`com.wizardsardine:bhwi-ffi-android`).
+(`wizardsardine/bhwi` issue #1). The crate exposes `bhwi`'s sans-io interpreter to
+Kotlin through [UniFFI](https://mozilla.github.io/uniffi-rs/), and the Gradle
+project here packages it as an AAR (`com.wizardsardine:bhwi-ffi-android`).
 
-Supported devices are the ones `bhwi-async` supports: Ledger (USB HID and BLE),
-Coldcard (USB HID), BitBox02 (USB HID), and Jade (USB serial and BLE).
+Supported devices are the ones `bhwi` supports: Ledger, Coldcard, BitBox02 and
+Jade, over whatever link the host implements.
 
 Status: experimental. The API is not stable and the artifact is published as a
-snapshot only.
+snapshot only. The Kotlin half of the repository is being reworked onto the
+interpreter-level API described below.
 
 ## Architecture
 
-The crate is deliberately thin: all protocol work stays in `bhwi`/`bhwi-async`.
+The crate contains no I/O at all. The host owns the transport, the per-device wire
+framing, the Jade PIN-server HTTP request and the driving loop; the crate owns the
+protocol state machines, which come from `bhwi`.
 
-- **Async in both directions.** Device commands are exported as UniFFI async
-  methods, so Kotlin sees `suspend fun`. The transports are foreign trait objects
-  (`#[uniffi::export(with_foreign)]`) with `async fn` methods, so the host
-  implements them as Kotlin `suspend fun` too. Rust never owns a socket, a USB
-  handle, or a GATT connection.
-- **One worker thread per session.** `bhwi-async` device objects are `!Send`, so
-  `connect_*` spawns a dedicated `bhwi-session` thread that constructs and drives
-  the device. Commands travel to it over an `mpsc` channel and the result comes
-  back over a oneshot, which is what keeps the exported futures `Send` (a UniFFI
-  requirement). A panic inside a command stops the worker rather than leaving the
-  device mid-protocol.
-- **Host-provided transports.** `HidChannel`, `SerialStream`, `BleChannel`,
-  `HttpBridge` (Jade PIN server only) and `PairingCodeListener` (BitBox02 noise
-  pairing code) are implemented in Kotlin. Ledger's BLE framing and the HID/CBOR
-  framing live in Rust so every host gets identical wire behaviour.
-- **One command in flight per session.** The channel serialises them. A second
-  concurrent call queues behind the first; it does not interleave on the wire.
-- **Cancellation is `disconnect()`.** It is idempotent, drops the sender, and every
-  later call fails with `HwiError.Closed`. It does not interrupt a command already
-  on the wire; the worker exits once that command finishes. Kotlin also gets the
-  usual UniFFI `close()` (the handle destructor, `AutoCloseable`) — call
-  `disconnect()` for deterministic teardown, then `close()`/`use { }` to free the
-  handle.
+- **One device-generic API.** `Interp` runs one `bhwi::common::Command` against one
+  device. Only the constructor is per-device (`new_ledger`, `new_jade`,
+  `new_bitbox`, `new_coldcard`). What crosses the boundary is a `Transmit`
+  (`payload`, `encrypted`, `recipient`) out and reply bytes in.
+- **Everything is synchronous.** No async, no worker threads, no foreign callbacks.
+  A command is a loop in Kotlin:
 
-  The exported name is `disconnect` rather than `close` because every UniFFI object
-  already generates a `close()`, and a second one is a Kotlin overload conflict.
+  ```kotlin
+  var transmit = interp.start(command)
+  while (true) {
+      val reply = send(transmit)             // host I/O: USB, BLE, or an HTTP POST
+      transmit = interp.exchange(reply) ?: break
+  }
+  val response = interp.end()
+  ```
+- **`Recipient` tells the host where a payload goes.** `Device` for the wire,
+  `PinServer { url }` for Jade's PIN server (POST the payload as
+  `application/json`, feed the response body back to `exchange`).
+- **State that outlives a command lives in a handle.** `NoiseHandle` holds BitBox02
+  pairing material (`export()` it after an unlock and restore it next time to skip
+  the on-screen confirmation; `takePairingCode()` polls the code mid-unlock).
+  `ColdcardEncryption` holds the link-encryption engine for one connection. An
+  interpreter leases its handle for its lifetime; a second interpreter on a leased
+  handle fails with `HwiException.BadState`.
+- **Typed errors.** Device refusals are `UserRefused`, pairing/handshake rejection
+  is `AuthRefused`, bad caller input is `InvalidInput`, and misuse of the object
+  lifecycle is `BadState`. There is no transport error variant: transport failures
+  are the host's own, in its own error type.
 
 ## Threading contract
 
-- **Never call a session method from the main thread's blocking path.** You do not
-  have to arrange that yourself: every device command is a `suspend fun`, so it
-  suspends the calling coroutine instead of blocking it. Calling from
-  `Dispatchers.Main` is safe.
-- **Blocking happens on the Rust worker thread.** `block_on` runs there, not on any
-  JVM thread.
-- **Your transport callbacks run off the main thread** and must not block it
-  either. They are `suspend fun`s; do the I/O with the platform's async APIs or on
-  `Dispatchers.IO`.
-- **Foreign objects must be thread-safe.** The Rust traits are `Send + Sync`.
-- **Sessions are not for sharing.** One `HwiSession` per connected device; treat
-  concurrent use as serialised, not parallel.
+- **All calls are blocking and cheap.** They do protocol work only (parsing,
+  encryption, PSBT handling) and never wait on a device, so calling from any
+  dispatcher is fine.
+- **Objects are `Send + Sync`** and internally locked; an `Interp` still runs one
+  command, and the sequence `start` / `exchange`* / `end` must not interleave with
+  itself.
+- **One `Interp` per command, one state handle per connection.** Both are consumed
+  or released explicitly (`end()`, or the UniFFI `close()`/`use { }` destructor).
 
 ## Prerequisites
 
@@ -139,32 +140,30 @@ dependencies { implementation("com.wizardsardine:bhwi-ffi-android:0.1.0-SNAPSHOT
 
 ## Adding a transport
 
-Two cases:
-
-- **New physical link, existing framing.** Implement the matching foreign trait in
-  Kotlin and hand it to the relevant `connect_*`. A USB-serial Jade and a BLE Jade
-  are both just a `SerialStream`, which is why `connect_jade_usb` and
-  `connect_jade_ble` are the same function. Nothing in Rust changes.
-- **New framing.** Add a Rust adapter in `bhwi-ffi/src/foreign.rs` implementing
-  `bhwi_async::Transport` (or `Channel`) over one of the foreign traits, then a
-  `connect_*` in `bhwi-ffi/src/session.rs`. `LedgerBleTransport` is the worked
-  example: it does Ledger's BLE chunking (`mtu - 5` for the first frame, `mtu - 3`
-  after) on top of the generic `BleChannel`.
-
-Read semantics matter: for `SerialStream`, an empty read means end of stream (the
-device is gone), so "no data yet" must suspend instead of returning empty.
+Entirely host-side: no Rust change. Move `transmit.payload` over the link, honour
+`transmit.encrypted` if the framing needs it, and feed the reply back. Framing (the
+Ledger HID/BLE chunking, the BitBox U2F/HWW frames, Jade's CBOR stream) belongs to
+the host too, which is what the fixtures below exist to verify.
 
 ## Fixtures and JVM replay testing
 
-`fixtures/*.json` hold report-level Ledger transcripts (`writes` and `reads` as hex
-HID reports, plus the expected outcome). They are produced and consumed by
-`bhwi-ffi/tests/fixtures.rs`, which drives the real `bhwi-async` Ledger device over
-an in-memory `HidChannel`.
+`fixtures/` holds two levels of checked-in vectors, both produced and verified by
+`bhwi-ffi/tests/fixtures.rs`:
 
-The same files let a JVM unit test replay a session through the real bindings, with
-no device and no emulator: `android/lib/src/test/kotlin/com/wizardsardine/bhwi/`
-implements `HidChannel` over the fixture's `reads`/`writes`, and the test task points
-JNA at the host library the build script already produced.
+- `ledger_*.json`: report-level transcripts (`writes`/`reads` as hex HID reports)
+  generated by driving the real `bhwi-async` Ledger transport in-memory.
+  `bhwi-async` is a dev-dependency for exactly this reason — the host reimplements
+  that framing and needs a byte-for-byte reference.
+- `transmit_*.json`: the same commands at the FFI boundary (`payload_hex`,
+  `encrypted`, `reply_hex` per exchange), so a Kotlin driving loop can be replayed
+  against a scripted device.
+
+Set `BHWI_REGENERATE_FIXTURES=1` to rewrite them after an intentional protocol
+change; otherwise any drift fails the test.
+
+A JVM unit test replays those vectors through the real bindings, with no device and
+no emulator, with JNA pointed at the host library the build script already
+produced.
 
 ```kotlin
 // lib/build.gradle.kts
@@ -185,12 +184,10 @@ nix develop -c bash -c 'cd android && ./gradlew :lib:testDebugUnitTest'  # JVM r
 nix develop -c bash tools/check.sh                                       # everything
 ```
 
-The JVM suite is the hard gate. It runs the real FFI boundary against the host
-cdylib and covers the fixture flows (fingerprint, xpub, refusal), the typed error
-mapping (`HwiException.Transport`, `.Disconnected`, `.UserRefused`, `.Closed`),
-session lifecycle (idempotent `disconnect()`, 10x connect/disconnect, use after
-close), command serialisation, coroutine cancellation, and the pure helpers against
-the same vectors the Rust unit tests use.
+The JVM suite is the hard gate: it runs the real FFI boundary against the host
+cdylib, covering the fixture flows (fingerprint, xpub, refusal), the typed error
+mapping, the object lifecycle, and the pure helpers against the same vectors the
+Rust tests use. It is being ported to the interpreter-level API.
 
 `android/sample` is a minimal app that consumes the **published** AAR from
 `mavenLocal` (not `project(":lib")`), so it exercises the real consumption path. Its
@@ -227,16 +224,12 @@ path. Verified against uniffi 0.32 with this crate:
   `generate --library target/release/libbhwi_ffi.so --language swift`, producing
   `bhwi_ffi.swift`, `bhwi_ffiFFI.h` and `bhwi_ffiFFI.modulemap`. No Rust source
   change and no second binding crate.
-- The async model carries over: exported device commands become Swift `async
-  throws`, and the foreign transport traits become `async throws` protocol
-  requirements, so an iOS app implements `HidChannel`/`BleChannel` in Swift exactly
-  as Android implements them in Kotlin.
+- The model carries over unchanged: the exported objects become Swift classes with
+  throwing methods, so an iOS app writes the same driving loop in Swift that
+  Android writes in Kotlin, over its own transport.
 
 Caveats, all verifiable from the generated output:
 
-- UniFFI declares the foreign protocols as `AnyObject, Sendable`. Swift enforces
-  that; Kotlin has no equivalent, so Swift transport implementations must actually
-  be concurrency-safe rather than merely documented as such.
 - Packaging is not shared. Swift needs the header and modulemap wired into an
   XCFramework; uniffi ships a dedicated `uniffi-bindgen-swift` CLI
   (`uniffi::uniffi_bindgen_swift()`, same `cli` feature) with `--headers`,

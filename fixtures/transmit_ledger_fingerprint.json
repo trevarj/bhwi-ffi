@@ -1,0 +1,11 @@
+{
+  "command": "get_master_fingerprint",
+  "exchanges": [
+    {
+      "encrypted": false,
+      "payload_hex": "e105000100",
+      "reply_hex": "f5acc2fd9000"
+    }
+  ],
+  "expected": "f5acc2fd"
+}

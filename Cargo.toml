@@ -14,7 +14,6 @@ bhwi-async = { git = "file:///home/trev/Workspace/bhwi", branch = "pairing-hook-
 async-trait = "0.1"
 futures = "0.3"
 hex = "0.4.3"
-log = "0.4"
 rand_core = "0.6.4"
 thiserror = "1"
 uniffi = "0.32.0"

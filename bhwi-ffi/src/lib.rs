@@ -1,26 +1,38 @@
-//! UniFFI (Kotlin/Android) bindings for BHWI.
+//! UniFFI (Kotlin/Android) bindings for BHWI's sans-io interpreter surface.
 //!
-//! The crate is deliberately thin: device protocol work stays in `bhwi`/`bhwi-async`,
-//! and everything here is either a foreign-object adapter, the session worker that owns
-//! the `!Send` device objects, or a pure helper for wallet plumbing.
+//! There is no I/O in this crate. One device-generic API over
+//! `bhwi::common::{Command, Transmit, Response, Error}` drives every supported device;
+//! only the constructor is per-device. The host owns the transport, the per-device wire
+//! framing, the PIN-server HTTP request and the driving loop. What crosses the FFI is
+//! `(payload bytes, encrypted flag, recipient)` out and reply bytes in.
+//!
+//! Driving model, per logical command:
+//!
+//! 1. `Interp.new_ledger()` / `new_bitbox(noise, network)` / `new_jade(network)` /
+//!    `new_coldcard(encryption)`
+//! 2. `start(command)` -> first `Transmit`
+//! 3. send `payload` to `recipient`, read the reply, feed it to `exchange(reply)` ->
+//!    next `Transmit`, or `null` when the machine is done
+//! 4. `end()` -> the typed `HwiResponse`
+//!
+//! An `Interp` runs exactly one command and is consumed by `end()`. Device state that
+//! must survive a command (BitBox noise pairing, Coldcard link encryption) lives in a
+//! separate handle the host keeps.
 
 uniffi::setup_scaffolding!();
 
-mod foreign;
 mod helpers;
-mod session;
+mod interp;
+mod state;
+mod types;
 
-pub use foreign::{
-    BleChannel, HidChannel, HttpBridge, PairingCodeListener, SerialStream, TransportError,
-};
 pub use helpers::{
     AddressEntry, InputSummary, OutputSummary, PsbtSummary, build_singlesig_descriptor,
     derive_addresses, psbt_summary,
 };
-pub use session::{
-    HwiSession, connect_bitbox_usb, connect_coldcard_usb, connect_jade_ble, connect_jade_usb,
-    connect_ledger_ble, connect_ledger_usb,
-};
+pub use interp::Interp;
+pub use state::{ColdcardEncryption, NoiseConfig, NoiseHandle};
+pub use types::{HwiCommand, HwiResponse, Recipient, Transmit};
 
 /// Bitcoin network selector, mirrored from `bitcoin::Network`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -75,41 +87,22 @@ impl From<AddressFormat> for bhwi::bitcoin::AddressType {
     }
 }
 
-/// Device version information returned by `HwiSession::get_info`.
-#[derive(Clone, Debug, uniffi::Record)]
-pub struct DeviceInfo {
-    pub version: String,
-    pub firmware: Option<String>,
-    pub networks: Vec<Network>,
-}
-
-impl From<bhwi_async::Info> for DeviceInfo {
-    fn from(info: bhwi_async::Info) -> Self {
-        Self {
-            version: info.version,
-            firmware: info.firmware,
-            networks: info.networks.into_iter().map(Network::from).collect(),
-        }
-    }
-}
-
 /// Errors surfaced to Kotlin. Messages never carry raw protocol payloads or key material.
+///
+/// I/O failures have no variant here: the host owns every transport, so it reports
+/// transport and HTTP problems in its own native error type.
 #[derive(Clone, Debug, thiserror::Error, uniffi::Error)]
 pub enum HwiError {
-    #[error("transport error: {msg}")]
-    Transport { msg: String },
-    #[error("http error: {msg}")]
-    Http { msg: String },
     #[error("device error: {msg}")]
     Device { msg: String },
     #[error("user refused the operation")]
     UserRefused,
-    #[error("device disconnected")]
-    Disconnected,
+    #[error("authentication refused")]
+    AuthRefused,
     #[error("invalid input: {msg}")]
     InvalidInput { msg: String },
-    #[error("session is closed")]
-    Closed,
+    #[error("bad state: {msg}")]
+    BadState { msg: String },
     #[error("internal error: {msg}")]
     Internal { msg: String },
 }
@@ -117,6 +110,18 @@ pub enum HwiError {
 impl HwiError {
     pub(crate) fn invalid(msg: impl std::fmt::Display) -> Self {
         Self::InvalidInput {
+            msg: msg.to_string(),
+        }
+    }
+
+    pub(crate) fn bad_state(msg: impl std::fmt::Display) -> Self {
+        Self::BadState {
+            msg: msg.to_string(),
+        }
+    }
+
+    pub(crate) fn internal(msg: impl std::fmt::Display) -> Self {
+        Self::Internal {
             msg: msg.to_string(),
         }
     }
