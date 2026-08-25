@@ -9,8 +9,15 @@ Supported devices are the ones `bhwi` supports: Ledger, Coldcard, BitBox02 and
 Jade, over whatever link the host implements.
 
 Status: experimental. The API is not stable and the artifact is published as a
-snapshot only. The Kotlin half of the repository is being reworked onto the
-interpreter-level API described below.
+snapshot only.
+
+The AAR ships two layers, and you can use either:
+
+- **`uniffi.bhwi_ffi`** — the raw interpreter surface generated from the crate.
+  Full control: you own the `Interp`, the state handles and the loop.
+- **`com.wizardsardine.bhwi`** — a Kotlin host layer over it: the per-device wire
+  framing, the driving loop, and an `HwiSession` facade with one suspend method per
+  command. Most apps only need this.
 
 ## Architecture
 
@@ -46,6 +53,120 @@ protocol state machines, which come from `bhwi`.
   is `AuthRefused`, bad caller input is `InvalidInput`, and misuse of the object
   lifecycle is `BadState`. There is no transport error variant: transport failures
   are the host's own, in its own error type.
+
+## The Kotlin host layer (`com.wizardsardine.bhwi`)
+
+Everything below is hand-written Kotlin in the AAR, not generated. It is the host
+half the crate deliberately does not contain.
+
+### Transport interfaces
+
+An app implements one of these per link. They are plain suspend interfaces; failures
+are reported as `TransportException.Io` / `.Disconnected` / `.Cancelled`, which is a
+plain Kotlin hierarchy (the FFI has no transport error variant — transport failures
+are the host's own).
+
+| Interface | Methods | Used by |
+|---|---|---|
+| `HidChannel` | `send(report): UInt`, `receive(maxLen): ByteArray` | Ledger, Coldcard, BitBox02 over USB |
+| `SerialStream` | `writeAll(data)`, `read(maxLen): ByteArray` | Jade, over USB serial or BLE |
+| `BleChannel` | `write(data)`, `read(): ByteArray`, `mtu(): UShort` | Ledger over BLE |
+| `HttpBridge` | `request(url, body): ByteArray` | Jade's PIN server only |
+
+Two contracts that are easy to get wrong:
+
+- **`SerialStream.read` returning an empty array means end of stream**, i.e. the
+  device is gone; it aborts the command with "stream ended before complete CBOR
+  message". "No data yet" must **not** return empty — suspend until at least one byte
+  is available, or throw `TransportException.Disconnected`.
+- **`HidChannel.send` gets a reused scratch buffer.** Consume it before returning and
+  do not keep a reference; the framing layer overwrites it for the next report.
+  (This mirrors the reference transports, down to the stale tail bytes a final short
+  chunk leaves behind — which is exactly what the report-level fixtures record.)
+
+`receive`/`read` may return fewer bytes than asked for, never more.
+
+### Links
+
+A `Link` is one logical request/response exchange with a device, whatever the wire
+framing underneath:
+
+```kotlin
+interface Link {
+    suspend fun exchange(payload: ByteArray, encrypted: Boolean): ByteArray
+}
+```
+
+The framings are ports of the `bhwi-async` transports (cross-checked against the
+maintainer's Zig host example):
+
+| Link | Framing |
+|---|---|
+| `LedgerHidLink(HidChannel)` | channel `0x0101`, tag `0x05`, u16 BE sequence, u16 BE total length, 64-byte reports |
+| `LedgerBleLink(BleChannel)` | tag `0x05`, u16 BE sequence, u16 BE length on frame 0; MTU inferred once with `[0x08,0,0,0,0]` |
+| `ColdcardHidLink(HidChannel)` | length byte with `0x80` on the last chunk and `0x40` when `encrypted` |
+| `BitBoxHidLink(HidChannel)` | U2F-HID frames carrying the HWW request/response layer, with the NOTREADY retry |
+| `JadeSerialLink(SerialStream)` | write, then read until one complete CBOR value has arrived |
+
+`encrypted` is only on the wire for Coldcard. BitBox ignores it (its noise encryption
+is inside the payload the interpreter already produced), and so do both reference
+transports.
+
+### The loop
+
+```kotlin
+val response = Hwi.runCommand(Interp.newLedger(), HwiCommand.GetMasterFingerprint, link)
+```
+
+`runCommand` does `start` -> send/receive -> `exchange` -> `end`, routes
+`Recipient.PinServer` transmits through the `http` bridge (and fails with `BadState`
+if there is none), and destroys the `Interp` on every path so its state lease is
+released. Pass `pairing = Hwi.Pairing(noiseHandle, ::showCode)` for BitBox02 and the
+pairing code is surfaced after every exchange, before the next payload goes out.
+
+### `HwiSession`
+
+One connected device, one command at a time. A `kotlinx` mutex serialises commands;
+each one builds a fresh `Interp` and delegates to `Hwi.runCommand`.
+
+```kotlin
+val session = HwiSession.ledgerUsb(myHidChannel)
+try {
+    session.unlock(Network.TESTNET)
+    val fingerprint = session.getMasterFingerprint()
+    val xpub = session.getExtendedPubkey("m/84'/1'/0'", display = false)
+} finally {
+    session.disconnect()
+}
+```
+
+Factories: `ledgerUsb(hid)`, `ledgerBle(ble)`, `coldcardUsb(hid)`,
+`bitboxUsb(hid, network, onPairingCode, noiseConfig)`, `jadeUsb(serial, http, network)`,
+`jadeBle(serial, http, network)`.
+
+Commands: `unlock`, `getInfo`, `getMasterFingerprint`, `getExtendedPubkey`,
+`displayAddress`, `signMessage`, `signPsbt`. `disconnect()` is idempotent and releases
+the device state handles; calls after it fail with `HwiException.BadState`. The
+transport itself belongs to the caller and is left alone.
+
+### BitBox02 pairing persistence
+
+Export the pairing material after a successful unlock and restore it next time, and
+the device stops asking the user to confirm the code:
+
+```kotlin
+val session = HwiSession.bitboxUsb(
+    hid = myHidChannel,
+    network = Network.TESTNET,
+    onPairingCode = { code -> showOnScreen(code) },   // first pairing only
+    noiseConfig = store.load(),                       // null on the very first run
+)
+session.unlock(Network.TESTNET)
+store.save(session.bitboxPairing())                   // NoiseConfig: privkey + device pubkeys
+```
+
+`NoiseConfig` is plain data (`privkey: ByteArray?`, `devicePubkeys: List<ByteArray>`).
+It is key material: persist it the way you would a private key.
 
 ## Threading contract
 
@@ -123,7 +244,8 @@ app build.
 ```
 jni/arm64-v8a/libbhwi_ffi.so
 jni/x86_64/libbhwi_ffi.so
-classes.jar            # uniffi/bhwi_ffi/*.class, package uniffi.bhwi_ffi
+classes.jar            # uniffi/bhwi_ffi/*.class  (generated bindings)
+                       # com/wizardsardine/bhwi/*.class  (Kotlin host layer)
 proguard.txt           # consumer rules keeping JNA + the bindings
 ```
 
@@ -140,10 +262,11 @@ dependencies { implementation("com.wizardsardine:bhwi-ffi-android:0.1.0-SNAPSHOT
 
 ## Adding a transport
 
-Entirely host-side: no Rust change. Move `transmit.payload` over the link, honour
-`transmit.encrypted` if the framing needs it, and feed the reply back. Framing (the
-Ledger HID/BLE chunking, the BitBox U2F/HWW frames, Jade's CBOR stream) belongs to
-the host too, which is what the fixtures below exist to verify.
+Entirely host-side: no Rust change. If the new link is one of the shapes above (an
+HID report channel, a byte stream, a GATT pair), implement that interface and reuse
+the existing `Link`. If it needs its own framing, implement `Link` directly: move
+`payload` over the wire, honour `encrypted` if the framing signals it, and return the
+reply. The fixtures below exist to verify exactly that layer.
 
 ## Fixtures and JVM replay testing
 
@@ -185,9 +308,20 @@ nix develop -c bash tools/check.sh                                       # every
 ```
 
 The JVM suite is the hard gate: it runs the real FFI boundary against the host
-cdylib, covering the fixture flows (fingerprint, xpub, refusal), the typed error
-mapping, the object lifecycle, and the pure helpers against the same vectors the
-Rust tests use. It is being ported to the interpreter-level API.
+cdylib. It covers
+
+- **report-level replay** — the Kotlin Ledger HID framing plus the real interpreter
+  against transcripts recorded from `bhwi-async`'s own transport, so any framing
+  drift fails as a byte mismatch;
+- **transmit-level replay** — the driving loop against a scripted `Link`, asserting
+  each payload and its `encrypted` flag, with no framing in the way;
+- **framing units** — Ledger HID chunking across reports, Ledger BLE MTU inference /
+  fragmentation / reassembly, the Coldcard chunk flags, U2F round trips and the HWW
+  retry, and the CBOR completeness scanner;
+- **lifecycle** — idempotent disconnect, post-disconnect `BadState`, mutex
+  serialisation of concurrent calls, and the state-handle lease (a second `Interp` on
+  a leased `NoiseHandle` is a `BadState`);
+- **the pure helpers**, against the same vectors the Rust tests use.
 
 `android/sample` is a minimal app that consumes the **published** AAR from
 `mavenLocal` (not `project(":lib")`), so it exercises the real consumption path. Its

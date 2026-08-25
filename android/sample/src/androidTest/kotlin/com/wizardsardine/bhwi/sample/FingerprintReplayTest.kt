@@ -2,19 +2,20 @@ package com.wizardsardine.bhwi.sample
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import com.wizardsardine.bhwi.HidChannel
+import com.wizardsardine.bhwi.HwiSession
+import com.wizardsardine.bhwi.TransportException
 import java.util.ArrayDeque
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Test
 import org.junit.runner.RunWith
-import uniffi.bhwi_ffi.HidChannel
-import uniffi.bhwi_ffi.TransportException
-import uniffi.bhwi_ffi.connectLedgerUsb
 
 /**
  * The JVM replay suite, run on-device against the AAR's own `arm64-v8a`/`x86_64`
- * `libbhwi_ffi.so`. Kept to the fingerprint flow: the point is that the packaged
- * library loads and the callback interface works under ART, not to re-test the driver.
+ * `libbhwi_ffi.so`. Kept to the fingerprint flow: the point is that the packaged library
+ * loads under ART and that the AAR's own Kotlin host layer drives it, not to re-test the
+ * framing.
  */
 @RunWith(AndroidJUnit4::class)
 class FingerprintReplayTest {
@@ -27,7 +28,7 @@ class FingerprintReplayTest {
             .use { it.readBytes().decodeToString() }
 
         val channel = ReplayHidChannel(strings("writes", json), strings("reads", json))
-        val session = connectLedgerUsb(channel)
+        val session = HwiSession.ledgerUsb(channel)
         try {
             assertEquals(expected(json), session.getMasterFingerprint())
         } finally {
@@ -46,21 +47,17 @@ class FingerprintReplayTest {
         Regex("\"expected\"\\s*:\\s*\"([^\"]*)\"").find(json)!!.groupValues[1]
 }
 
-/** Same contract as the JVM `ReplayHidChannel`; see `lib/src/test/.../Replay.kt`. */
+/** Same contract as the JVM `ReplayHidChannel`; see `lib/src/test/.../Fixtures.kt`. */
 private class ReplayHidChannel(writes: List<String>, reads: List<String>) : HidChannel {
     private val writes = ArrayDeque(writes)
     private val reads = ArrayDeque(reads)
-    private val problems = mutableListOf<String>()
     private val lock = Any()
 
     override suspend fun send(report: ByteArray): UInt = synchronized(lock) {
         val actual = report.joinToString("") { "%02x".format(it) }
         val expected = writes.pollFirst()
         if (expected != actual) {
-            // UniFFI only catches `Exception` in foreign callbacks, so report the
-            // mismatch as a transport failure and re-raise it from `check()`.
-            problems += "write mismatch\n  expected: $expected\n  actual:   $actual"
-            throw TransportException.Io("write mismatch")
+            throw AssertionError("write mismatch\n  expected: $expected\n  actual:   $actual")
         }
         report.size.toUInt()
     }
@@ -72,7 +69,6 @@ private class ReplayHidChannel(writes: List<String>, reads: List<String>) : HidC
     }
 
     fun check() = synchronized(lock) {
-        if (problems.isNotEmpty()) throw AssertionError(problems.joinToString("\n"))
         if (writes.isNotEmpty()) throw AssertionError("unwritten reports: ${writes.size}")
     }
 }

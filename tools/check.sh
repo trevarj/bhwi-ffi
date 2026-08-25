@@ -36,10 +36,23 @@ for want in jni/arm64-v8a/libbhwi_ffi.so jni/x86_64/libbhwi_ffi.so classes.jar; 
   grep -qx "$want" <<<"$entries" || { echo "missing from AAR: $want" >&2; exit 1; }
 done
 
-# The generated bindings must actually be compiled into the AAR, not just present
-# as sources: check the object class and the file class holding the free functions.
+# Both halves of the library must actually be compiled into the AAR, not just present as
+# sources: the generated interpreter object and the file class holding the free functions,
+# plus the hand-written Kotlin host layer (transports, framing links, loop, facade).
 classes=$(unzip -p "$aar" classes.jar > "$root/target/aar-classes.jar" && unzip -Z1 "$root/target/aar-classes.jar")
-for want in uniffi/bhwi_ffi/HwiSession.class uniffi/bhwi_ffi/Bhwi_ffiKt.class; do
+for want in \
+  uniffi/bhwi_ffi/Interp.class \
+  uniffi/bhwi_ffi/Bhwi_ffiKt.class \
+  com/wizardsardine/bhwi/HwiSession.class \
+  com/wizardsardine/bhwi/Hwi.class \
+  com/wizardsardine/bhwi/Link.class \
+  com/wizardsardine/bhwi/HidChannel.class \
+  com/wizardsardine/bhwi/LedgerHidLink.class \
+  com/wizardsardine/bhwi/LedgerBleLink.class \
+  com/wizardsardine/bhwi/ColdcardHidLink.class \
+  com/wizardsardine/bhwi/BitBoxHidLink.class \
+  com/wizardsardine/bhwi/JadeSerialLink.class
+do
   grep -qx "$want" <<<"$classes" || { echo "missing from classes.jar: $want" >&2; exit 1; }
 done
 
