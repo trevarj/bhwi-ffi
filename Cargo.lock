@@ -189,6 +189,7 @@ name = "bhwi-ffi"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64ct",
  "bhwi",
  "bhwi-async",
  "futures",
