@@ -1,0 +1,7 @@
+[toolchain]
+# Match bhwi's pinned toolchain so interpreter behavior is identical.
+channel = "1.94.0"
+components = ["cargo", "rustc", "rustfmt", "clippy"]
+# Android targets for the AAR; host target is implicit (JVM replay tests).
+targets = ["aarch64-linux-android", "x86_64-linux-android"]
+profile = "default"

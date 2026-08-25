@@ -1,0 +1,26 @@
+[package]
+name = "bhwi-ffi"
+version = "0.1.0"
+edition = "2024"
+authors.workspace = true
+license-file.workspace = true
+repository = "https://github.com/wizardsardine/bhwi-ffi"
+description = "UniFFI (Kotlin/Android) bindings for BHWI"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "bhwi_ffi"
+
+[dependencies]
+async-trait.workspace = true
+bhwi = { workspace = true, features = ["bitbox"] }
+bhwi-async = { workspace = true, features = ["bitbox"] }
+futures.workspace = true
+hex.workspace = true
+log.workspace = true
+rand_core = { workspace = true, features = ["getrandom"] }
+thiserror.workspace = true
+uniffi.workspace = true
+
+[dev-dependencies]
+serde_json = "1"
