@@ -39,7 +39,11 @@ pub struct PsbtSummary {
     pub fee_sat: Option<u64>,
 }
 
-/// Builds the standard multipath singlesig descriptor `<0;1>/*` for an account xpub.
+/// Builds the standard multipath singlesig descriptor for an account xpub: the
+/// `<0;1>` receive/change pair followed by a wildcard index.
+///
+/// (The literal `/` + `*` suffix is spelled out rather than written inline because
+/// UniFFI copies doc comments verbatim and Kotlin block comments nest.)
 #[uniffi::export]
 pub fn build_singlesig_descriptor(
     xpub: String,

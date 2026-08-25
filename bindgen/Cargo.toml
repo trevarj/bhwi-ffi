@@ -1,0 +1,17 @@
+[package]
+name = "bhwi-ffi-bindgen"
+version = "0.1.0"
+edition = "2024"
+authors.workspace = true
+license-file.workspace = true
+description = "uniffi-bindgen CLI pinned to the uniffi version bhwi-ffi links against"
+publish = false
+
+# Separate crate so the `cli` feature (clap, the bindgen backends) never reaches
+# the cdylib's dependency graph.
+[[bin]]
+name = "bhwi-ffi-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+uniffi = { workspace = true, features = ["cli"] }

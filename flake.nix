@@ -55,6 +55,8 @@
             pkgs.cargo-ndk
             pkgs.jdk21
             androidSdk
+            # tools/check.sh inspects the AAR.
+            pkgs.unzip
           ];
           JAVA_HOME = pkgs.jdk21.home;
           ANDROID_HOME = sdkRoot;

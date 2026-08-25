@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["bhwi-ffi"]
+members = ["bhwi-ffi", "bindgen"]
 
 [workspace.package]
 authors = ["Edouard Paris <m@edouard.paris>", "Trevor Arjeski <tmarjeski@gmail.com>"]

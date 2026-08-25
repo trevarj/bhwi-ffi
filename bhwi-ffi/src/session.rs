@@ -159,6 +159,12 @@ impl HwiSession {
     }
 
     /// Idempotent. Stops the worker; later calls fail with `HwiError::Closed`.
+    ///
+    /// Exported as `disconnect` because every UniFFI object already has a generated
+    /// `close()` (the handle destructor), and a second `close` collides with it in
+    /// Kotlin. `disconnect()` is the deterministic one: it drops the sender even when
+    /// a future still holds a reference to the session.
+    #[uniffi::method(name = "disconnect")]
     pub fn close(&self) {
         if let Ok(mut guard) = self.sender.lock() {
             guard.take();
