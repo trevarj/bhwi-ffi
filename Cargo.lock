@@ -150,7 +150,7 @@ checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 [[package]]
 name = "bhwi"
 version = "0.0.1"
-source = "git+https://github.com/wizardsardine/bhwi?rev=b2fe6d73be13897f7bcaae641962b72f9e0f9b10#b2fe6d73be13897f7bcaae641962b72f9e0f9b10"
+source = "git+file:///home/trev/Workspace/bhwi?branch=pairing-hook-send#3b82355baad9d63c9f5be0f509018ec2f940b8fc"
 dependencies = [
  "aes",
  "base64ct",
@@ -180,7 +180,7 @@ dependencies = [
 [[package]]
 name = "bhwi-async"
 version = "0.0.1"
-source = "git+https://github.com/wizardsardine/bhwi?rev=b2fe6d73be13897f7bcaae641962b72f9e0f9b10#b2fe6d73be13897f7bcaae641962b72f9e0f9b10"
+source = "git+file:///home/trev/Workspace/bhwi?branch=pairing-hook-send#3b82355baad9d63c9f5be0f509018ec2f940b8fc"
 dependencies = [
  "async-trait",
  "bhwi",
