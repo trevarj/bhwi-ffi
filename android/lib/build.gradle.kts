@@ -22,6 +22,9 @@ android {
             kotlin.srcDir("src/main/kotlin")
             jniLibs.srcDir("src/main/jniLibs")
         }
+        named("test") {
+            kotlin.srcDir("src/test/kotlin")
+        }
     }
 
     compileOptions {
@@ -46,6 +49,31 @@ dependencies {
     // Exactly what the generated bindings import.
     implementation("net.java.dev.jna:jna:5.19.0@aar")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation(kotlin("test"))
+    // The `@aar` artifact above carries no desktop JNI dispatch library, so the JVM
+    // replay tests need the plain jar.
+    testImplementation("net.java.dev.jna:jna:5.19.0")
+}
+
+// JVM unit tests load the host cdylib built by tools/build-android.sh and replay the
+// transcripts checked into fixtures/; both live outside the Gradle project.
+tasks.withType<Test>().configureEach {
+    // Declared as inputs so a rebuilt cdylib or an edited fixture invalidates a cached
+    // test result; a system property alone would let a stale PASS survive both.
+    inputs.file(rootDir.resolve("../target/release/libbhwi_ffi.so"))
+        .withPropertyName("hostCdylib")
+        .withPathSensitivity(PathSensitivity.NONE)
+    inputs.dir(rootDir.resolve("../fixtures"))
+        .withPropertyName("fixtures")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+    systemProperty("jna.library.path", rootDir.resolve("../target/release").canonicalPath)
+    systemProperty("bhwi.fixtures.dir", rootDir.resolve("../fixtures").canonicalPath)
+    testLogging {
+        events("passed", "skipped", "failed")
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    }
 }
 
 publishing {

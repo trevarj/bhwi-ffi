@@ -21,6 +21,11 @@ echo "==> build-android"
 echo "==> gradle"
 (cd android && ./gradlew --no-daemon :lib:assembleRelease publishToMavenLocal)
 
+echo "==> jvm replay tests"
+# Replays the checked-in Ledger transcripts through the real FFI boundary against the
+# host cdylib built above.
+(cd android && ./gradlew --no-daemon :lib:testDebugUnitTest)
+
 echo "==> aar contents"
 aar=android/lib/build/outputs/aar/lib-release.aar
 test -f "$aar"
@@ -49,5 +54,9 @@ do
   test -s "$m2/$want" || { echo "missing publication file: $m2/$want" >&2; exit 1; }
 done
 ls -l "$m2"
+
+echo "==> sample app (consumes the mavenLocal AAR)"
+# Must come after the publication: `:sample` depends on the artifact, not the project.
+(cd android && ./gradlew --no-daemon :sample:assembleDebug :sample:assembleDebugAndroidTest)
 
 echo "==> all checks passed"

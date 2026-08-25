@@ -111,8 +111,9 @@ It is idempotent and wipes both generated trees first. Both are `.gitignore`d:
 before building the AAR. After that, the Gradle build needs only a JDK and the SDK.
 
 `tools/check.sh` is the full gate: `cargo fmt --check`, `cargo clippy -D warnings`,
-`cargo test`, `build-android.sh`, `:lib:assembleRelease publishToMavenLocal`, then
-assertions on the AAR contents and the published files.
+`cargo test`, `build-android.sh`, `:lib:assembleRelease publishToMavenLocal`, the JVM
+replay suite, assertions on the AAR contents and the published files, and the sample
+app build.
 
 ### Artifact layout
 
@@ -161,17 +162,54 @@ HID reports, plus the expected outcome). They are produced and consumed by
 an in-memory `HidChannel`.
 
 The same files let a JVM unit test replay a session through the real bindings, with
-no device and no emulator: implement `HidChannel` in Kotlin over the fixture's
-`reads`/`writes`, and point JNA at the host library the build script already
-produced.
+no device and no emulator: `android/lib/src/test/kotlin/com/wizardsardine/bhwi/`
+implements `HidChannel` over the fixture's `reads`/`writes`, and the test task points
+JNA at the host library the build script already produced.
 
 ```kotlin
-// build.gradle.kts (test task)
-systemProperty("jna.library.path", rootProject.file("../target/release").absolutePath)
+// lib/build.gradle.kts
+tasks.withType<Test>().configureEach {
+    systemProperty("jna.library.path", rootDir.resolve("../target/release").canonicalPath)
+    systemProperty("bhwi.fixtures.dir", rootDir.resolve("../fixtures").canonicalPath)
+}
 ```
 
 The generated bindings load the library by the base name `bhwi_ffi`, so
 `target/release/libbhwi_ffi.so` is found as-is.
+
+## Testing
+
+```sh
+nix develop -c ./tools/build-android.sh                                  # once
+nix develop -c bash -c 'cd android && ./gradlew :lib:testDebugUnitTest'  # JVM replay suite
+nix develop -c bash tools/check.sh                                       # everything
+```
+
+The JVM suite is the hard gate. It runs the real FFI boundary against the host
+cdylib and covers the fixture flows (fingerprint, xpub, refusal), the typed error
+mapping (`HwiException.Transport`, `.Disconnected`, `.UserRefused`, `.Closed`),
+session lifecycle (idempotent `disconnect()`, 10x connect/disconnect, use after
+close), command serialisation, coroutine cancellation, and the pure helpers against
+the same vectors the Rust unit tests use.
+
+`android/sample` is a minimal app that consumes the **published** AAR from
+`mavenLocal` (not `project(":lib")`), so it exercises the real consumption path. Its
+`androidTest` replays the fingerprint fixture on-device, reading the same
+`fixtures/*.json` (wired in as androidTest assets).
+
+```sh
+nix develop -c bash tools/instrumentation.sh
+```
+
+creates the API 34 x86_64 AVD if needed, boots it headless from the
+`nix develop .#emulator` shell, and runs `:sample:connectedDebugAndroidTest`.
+
+**KVM note:** without `/dev/kvm` the script falls back to `-accel off` (full
+software emulation). Boot then takes 10-15 minutes, `system_server` can stall long
+enough for a run to fail with `Unknown API Level` or
+`Can't find service: package` (re-run; the device recovers), and a single
+instrumentation test takes ~80s. That is why the JVM suite — not the emulator — is
+what `tools/check.sh` gates on. On a host with KVM, pass `BHWI_ACCEL=auto`.
 
 ## Developing against a local bhwi checkout
 
