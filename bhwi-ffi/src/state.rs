@@ -17,7 +17,7 @@ use bhwi::coldcard::encrypt::Engine;
 use crate::HwiError;
 
 /// The two states this crate hands out `&mut` to must be `Send`, or the objects holding
-/// them could not be shared with Kotlin.
+/// them could not be shared with foreign-language hosts.
 const _: () = {
     const fn assert_send<T: Send>() {}
     assert_send::<NoiseState>();

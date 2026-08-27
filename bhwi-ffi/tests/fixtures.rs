@@ -1,11 +1,11 @@
-//! Checked-in vectors for the Kotlin side, at both levels of the split.
+//! Checked-in vectors for host bindings, at both levels of the split.
 //!
 //! * Report level: the real `bhwi-async` Ledger device driven over an in-memory HID
-//!   channel. Kotlin reimplements that framing, so it needs the exact reports. This is
+//!   channel. Hosts reimplement that framing, so they need the exact reports. This is
 //!   the only place `bhwi-async` is used, and it is a dev-dependency: no I/O ships in
 //!   the library.
-//! * Transmit level: the same commands driven through `Interp`, the surface Kotlin
-//!   actually calls, so a host loop can be replayed without a device.
+//! * Transmit level: the same commands driven through `Interp`, the FFI surface hosts
+//!   call, so a driving loop can be replayed without a device.
 //!
 //! Any protocol drift fails the test instead of silently rewriting the vectors.
 
@@ -221,7 +221,7 @@ fn ledger_refused() {
     assert_report_fixture("ledger_refused.json", &writes, &reads, "UserRefused");
 }
 
-// ---- transmit level: what the Kotlin host loop sees --------------------------------
+// ---- transmit level: what a host driving loop sees ---------------------------------
 
 /// Drives `command` through `interp` with the scripted replies, recording each
 /// `(payload, encrypted, reply)` triple, and checks the result in as a fixture.

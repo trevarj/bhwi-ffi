@@ -1,5 +1,5 @@
 {
-  description = "bhwi-ffi: Android (UniFFI/Kotlin) bindings for BHWI";
+  description = "bhwi-ffi: UniFFI bindings for BHWI";
 
   inputs = {
     # Same nixpkgs rev motd uses: androidenv there is known-good on this setup.

@@ -53,7 +53,7 @@ impl From<bc::Transmit> for Transmit {
 /// The singlesig subset of `bhwi::common::Command`.
 ///
 /// Setup, wipe, restore, backup, wallet registration and multisig/descriptor address
-/// display are out of scope for the Android bindings.
+/// display are out of scope for these FFI bindings.
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum HwiCommand {
     /// Ledger: opens the Bitcoin app. Jade/BitBox/Coldcard: authenticates the device.

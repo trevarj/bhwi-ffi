@@ -1,4 +1,4 @@
-//! UniFFI (Kotlin/Android) bindings for BHWI's sans-io interpreter surface.
+//! UniFFI bindings for BHWI's sans-io interpreter surface.
 //!
 //! There is no I/O in this crate. One device-generic API over
 //! `bhwi::common::{Command, Transmit, Response, Error}` drives every supported device;
@@ -87,7 +87,7 @@ impl From<AddressFormat> for bhwi::bitcoin::AddressType {
     }
 }
 
-/// Errors surfaced to Kotlin. Messages never carry raw protocol payloads or key material.
+/// Errors surfaced to foreign-language hosts. Messages never carry raw protocol payloads or key material.
 ///
 /// I/O failures have no variant here: the host owns every transport, so it reports
 /// transport and HTTP problems in its own native error type.

@@ -42,8 +42,8 @@ pub struct PsbtSummary {
 /// Builds the standard multipath singlesig descriptor for an account xpub: the
 /// `<0;1>` receive/change pair followed by a wildcard index.
 ///
-/// (The literal `/` + `*` suffix is spelled out rather than written inline because
-/// UniFFI copies doc comments verbatim and Kotlin block comments nest.)
+/// (The wildcard suffix is described rather than written inline because UniFFI copies
+/// doc comments into generated block comments.)
 #[uniffi::export]
 pub fn build_singlesig_descriptor(
     xpub: String,
