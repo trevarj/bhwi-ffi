@@ -8,7 +8,7 @@ repository = "https://github.com/wizardsardine/bhwi-ffi"
 description = "UniFFI bindings for BHWI"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib", "staticlib", "rlib"]
 name = "bhwi_ffi"
 
 [dependencies]

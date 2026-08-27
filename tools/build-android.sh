@@ -24,7 +24,7 @@ echo "==> kotlin bindings"
 # Library mode reads the metadata out of the freshly built host cdylib, so the
 # bindings can never drift from the scaffolding. `--no-format` because ktlint is
 # not in the devshell.
-cargo run --locked --release -q -p bhwi-ffi-bindgen -- generate \
+cargo run --locked --release -q -p bhwi-ffi-bindgen --bin bhwi-ffi-bindgen -- generate \
   --library target/release/libbhwi_ffi.so \
   --language kotlin \
   --out-dir "$kotlin_out" \

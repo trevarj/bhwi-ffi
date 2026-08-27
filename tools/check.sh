@@ -18,6 +18,19 @@ cargo test --locked --workspace
 echo "==> build-android"
 bash ./tools/build-android.sh
 
+echo "==> swift bindings (host metadata)"
+swift_check=target/swift-check
+rm -rf "$swift_check"
+cargo run --release -q -p bhwi-ffi-bindgen --bin bhwi-ffi-bindgen-swift -- \
+  target/release/libbhwi_ffi.so "$swift_check" \
+  --swift-sources --headers --modulemap --xcframework \
+  --module-name BhwiFFI --modulemap-filename module.modulemap
+for want in Bhwi.swift BhwiFFI.h module.modulemap; do
+  test -s "$swift_check/$want" || { echo "missing Swift binding output: $want" >&2; exit 1; }
+done
+grep -q '^framework module BhwiFFI {' "$swift_check/module.modulemap"
+grep -q '^import BhwiFFI$' "$swift_check/Bhwi.swift"
+
 echo "==> gradle"
 (cd android && bash ./gradlew --no-daemon :lib:assembleRelease publishToMavenLocal)
 

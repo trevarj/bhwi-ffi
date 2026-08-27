@@ -7,3 +7,4 @@ local.properties
 .idea/
 android/lib/src/main/jniLibs/
 android/lib/src/main/kotlin/uniffi/
+ios/Sources/Bhwi/Generated/
