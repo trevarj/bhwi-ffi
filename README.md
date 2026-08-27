@@ -8,10 +8,10 @@ this crate exposes their typed commands, transmits, responses and errors through
 owns I/O, wire framing, HTTP and the driving loop, with no embedded Rust async
 runtime.
 
-This repository currently builds Kotlin bindings and an Android AAR containing a
-handwritten Kotlin host layer. The API is experimental and not stable. The
-publication workflow installs a snapshot in **Maven Local**, not a remote artifact
-repository.
+This repository builds Kotlin bindings and an Android AAR, and contains a local
+Swift package for iOS. The API is experimental and not stable. Android publication
+installs a snapshot in **Maven Local**; Swift artifacts are built locally, not
+published as a remote package.
 
 ## Workspace
 
@@ -26,6 +26,14 @@ Outside the Cargo workspace, `android/` packages the generated bindings and Kotl
 host layer and supplies a consumer sample; `tools/` contains build and verification
 scripts. `bhwi-async` is only a test dependency, used to produce reference transport
 fixtures; its I/O and runtime integration do not ship in the native library.
+
+## Runtime support
+
+| Host | Status | Evidence and limits |
+|---|---|---|
+| Kotlin / Android (arm64-v8a, x86_64) | Experimental baseline | JVM fixture replay and Android build/instrumentation tooling; hardware behavior is not guaranteed. Run the separate instrumentation script to execute emulator tests. |
+| Swift / iOS 16+ (arm64 device, arm64 simulator) | **UNTESTED** on physical devices | Apple build, simulator XCTest, runtime and device signing are **unverified**. Local XCFramework and caller-owned adapters are required. |
+| Swift / macOS | Unsupported | No macOS slice in the XCFramework; the package does not support macOS. |
 
 ## Supported devices and capabilities
 
@@ -327,24 +335,86 @@ The minimum Android API is 28. `x86_64` supports the emulator; there is no
 `libjnidispatch.so`) and `kotlinx-coroutines-core` are transitive dependencies of the
 published artifact.
 
-## Swift and iOS
+## Swift / iOS
 
-Sharing this UniFFI crate with future Swift bindings is the recommended path. The
-same version-matched generator can emit Swift; a Swift host would drive the same
-interpreter lifecycle over its own transports.
-
-Build the host library (also done by the Android builder), then generate:
+`Package.swift` exposes `Bhwi` for iOS 16+. It contains generated UniFFI types
+and a Swift host layer (`Hwi`, actor-isolated `HwiSession`, framing links and
+transport protocols). Building the local package requires full Xcode, an iOS SDK,
+Cargo and the Rust iOS arm64 device/simulator targets in `rust-toolchain.toml`.
+On an Apple Silicon Mac, from the repository root:
 
 ```sh
-nix develop -c cargo build --locked --release -p bhwi-ffi
-nix develop -c cargo run --locked --release -p bhwi-ffi-bindgen -- generate --library target/release/libbhwi_ffi.so --language swift --out-dir target/generated-swift --no-format
+bash tools/build-ios.sh
+# Add this directory as a local Swift package dependency in Xcode.
+bash tools/check-ios.sh
 ```
 
-This produces `bhwi_ffi.swift`, `bhwi_ffiFFI.h` and `bhwi_ffiFFI.modulemap` in
-`target/generated-swift/`, **not a tested iOS package**. This repository has no Swift
-host layer or Apple build/XCFramework pipeline. The Linux `.so` supplies generation
-metadata, not an iOS runtime library; native Apple builds require the appropriate
-Apple targets and Xcode/macOS, followed by platform-specific packaging.
+The builder uses locked Cargo resolution, generates
+`ios/Sources/Bhwi/Generated/Bhwi.swift` plus the C header/module map, and
+assembles `target/ios/BhwiFFI.xcframework` from arm64 iOS device and simulator
+static libraries. Generated code and native artifacts are ignored: rebuild
+after cloning or changing the native API. The package cannot resolve from a
+remote checkout without those artifacts. There is no Intel simulator or macOS
+slice. `check-ios.sh` selects an available iPhone simulator and runs XCTest;
+override selection with `BHWI_IOS_DESTINATION='platform=iOS Simulator,name=iPhone 16'`.
+Apple artifact builds and simulator execution remain unverified.
+
+Swift exposes `unlock`, `getInfo`, `getMasterFingerprint`, `getExtendedPubkey`,
+`displayAddress`, `signMessage`, `signPsbt` and BitBox02 pairing export, subject
+to the native command/device limitations above (notably no Ledger PSBT signing).
+For example, a **caller-owned testnet wallet** can supply an unsigned PSBT and
+a caller-owned Jade BLE serial adapter and trusted PIN-server HTTP bridge:
+
+```swift
+func signOnJade(
+  testnetPsbtBase64: String,
+  jadeBleStream: any SerialStream,
+  trustedPinBridge: any HttpBridge
+) async throws -> String {
+  let session = HwiSession.jade(
+    serial: jadeBleStream, http: trustedPinBridge, network: .testnet)
+  do {
+    try await session.unlock(network: .testnet)
+    let signed = try await session.signPsbt(testnetPsbtBase64)
+    await session.disconnect()
+    return signed
+  } catch {
+    await session.disconnect()
+    throw error
+  }
+}
+```
+
+This illustrates the API, **not tested device signing**: the caller must
+configure the Jade for testnet, create/validate a wallet PSBT, implement BLE
+stream framing and a PIN bridge that restricts device-supplied URLs to trusted
+HTTPS hosts and prevents unsafe redirects. The returned PSBT still needs
+wallet-side verification and finalization. Device signing, platform adapter
+integration and acceptance on a signed iOS app remain outstanding.
+
+The caller supplies `HidChannel` (Ledger/Coldcard/BitBox02 USB), `BleChannel`
+(Ledger BLE), `SerialStream` (Jade serial/BLE), and `HttpBridge` (Jade PIN
+server). Generic USB HID is not available to ordinary iOS apps; USB factories
+need an allowed accessory mechanism. No platform transport ships here.
+Transport implementations must honor requested read sizes, fail on EOF, avoid
+leaking payloads in errors, cooperate with task cancellation and unblock their
+own I/O. `HwiSession` serializes commands and pairing export; `disconnect()`
+does not cancel an in-flight command or close transport. Cancel the operation,
+unblock I/O if necessary, await completion, disconnect, then dispose the
+caller-owned transport. Native constructors/helpers are synchronous and belong
+off the main actor. Keep BitBox02 pairing key material in secure storage.
+
+The Linux gate additionally checks Swift binding/header/module-map
+**generation** against host metadata; it neither builds the iOS XCFramework
+nor compiles Swift. Apple simulator replay, iOS runtime and physical-device
+signing still require the Apple gate and a signed app with real adapters.
+
+Host-source verification on Linux x86_64 with Swift 5.10.1 passed all 31 XCTest
+cases against the real generated bindings and Rust library, using a temporary
+host package and explicit XCTest registration. A separate Swift consumer replayed
+the Ledger fingerprint fixture and checked post-disconnect errors. The Jade
+near-limit coalesced-response regression failed before its fix and passed after.
+This does not validate the iOS binary target or establish a supported Linux package.
 
 ## Development and verification
 
@@ -360,6 +430,9 @@ the real JVM replay suite; checks AAR contents and publication files; and builds
 the sample and instrumentation APKs. Clippy, Rust tests, native builds and bindgen
 use `--locked` so dependency resolution cannot silently update the lockfile. The gate **builds
 instrumentation APKs but does not run them**.
+
+The gate also generates the Swift source/header/module map from host metadata;
+it does not compile Swift or validate the Apple binary target.
 
 ### Fixtures and JVM replay
 
@@ -453,6 +526,8 @@ URL in `Cargo.toml`.
   and [command loop](android/lib/src/main/kotlin/com/wizardsardine/bhwi/Hwi.kt).
 - [Transport contracts](android/lib/src/main/kotlin/com/wizardsardine/bhwi/Transports.kt)
   and [framing implementations](android/lib/src/main/kotlin/com/wizardsardine/bhwi/Links.kt).
+- [Swift host commands](ios/Sources/Bhwi/Hwi.swift), [sessions](ios/Sources/Bhwi/HwiSession.swift),
+  [transport contracts](ios/Sources/Bhwi/Transports.swift) and [framing](ios/Sources/Bhwi/Links.swift).
 - [Upstream BHWI design rationale](https://github.com/wizardsardine/bhwi/blob/main/docs/VISION.md).
 
 ## License
