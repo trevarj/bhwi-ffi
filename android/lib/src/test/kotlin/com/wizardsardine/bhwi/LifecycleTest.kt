@@ -3,14 +3,22 @@ package com.wizardsardine.bhwi
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertFailsWith
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Test
+import uniffi.bhwi_ffi.ColdcardEncryption
 import uniffi.bhwi_ffi.HwiCommand
 import uniffi.bhwi_ffi.HwiException
 import uniffi.bhwi_ffi.Interp
@@ -96,12 +104,75 @@ class LifecycleTest {
 
     @Test
     fun `runCommand destroys the interpreter even when the link fails`() = runBlocking<Unit> {
-        val interp = Interp.newLedger()
-        assertFailsWith<TransportException.Disconnected> {
-            Hwi.runCommand(interp, HwiCommand.GetMasterFingerprint, FailingLink())
+        ColdcardEncryption().use { encryption ->
+            val interp = Interp.newColdcard(encryption)
+            assertFailsWith<TransportException.Disconnected> {
+                Hwi.runCommand(interp, HwiCommand.Unlock(Network.TESTNET), FailingLink())
+            }
+            // Destroyed means destroyed: the generated wrapper refuses any further call.
+            assertFailsWith<IllegalStateException> { interp.end() }
+            Interp.newColdcard(encryption).use { next ->
+                val transmit = next.start(HwiCommand.Unlock(Network.TESTNET))
+                assertEquals("ncry", transmit.payload.copyOfRange(0, 4).decodeToString())
+                assertFalse(transmit.encrypted)
+            }
         }
-        // Destroyed means destroyed: the generated wrapper refuses any further call.
-        assertFailsWith<IllegalStateException> { interp.end() }
+    }
+
+    @Test
+    fun `cancellation before dispatch still releases the interpreter lease`() = runBlocking<Unit> {
+        NoiseHandle(null).use { noise ->
+            Interp.newBitbox(noise, Network.TESTNET).use { interp ->
+                var linkCalled = false
+                val link = object : Link {
+                    override suspend fun exchange(payload: ByteArray, encrypted: Boolean): ByteArray {
+                        linkCalled = true
+                        throw AssertionError("a cancelled command reached the link")
+                    }
+                }
+                val call = async(start = CoroutineStart.UNDISPATCHED) {
+                    cancel()
+                    Hwi.runCommand(interp, HwiCommand.Unlock(Network.TESTNET), link)
+                }
+                assertFailsWith<CancellationException> { call.await() }
+                assertFalse(linkCalled)
+                assertEquals(null, noise.export().privkey)
+                Interp.newBitbox(noise, Network.TESTNET).use { next ->
+                    assertEquals("u", next.start(HwiCommand.Unlock(Network.TESTNET)).payload.decodeToString())
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `synchronous transport cancellation stops before native handshake mutation`() = runBlocking<Unit> {
+        NoiseHandle(null).use { noise ->
+            val payloads = mutableListOf<String>()
+            val link = object : Link {
+                override suspend fun exchange(payload: ByteArray, encrypted: Boolean): ByteArray {
+                    val request = payload.decodeToString()
+                    payloads += request
+                    return when (request) {
+                        "u" -> ByteArray(0)
+                        "h" -> {
+                            currentCoroutineContext().cancel()
+                            byteArrayOf(0)
+                        }
+                        else -> throw AssertionError("unexpected handshake payload")
+                    }
+                }
+            }
+            val call = async {
+                Hwi.runCommand(
+                    Interp.newBitbox(noise, Network.TESTNET),
+                    HwiCommand.Unlock(Network.TESTNET),
+                    link,
+                )
+            }
+            assertFailsWith<CancellationException> { call.await() }
+            assertEquals(listOf("u", "h"), payloads)
+            assertEquals(null, noise.export().privkey)
+        }
     }
 
     @Test
@@ -128,18 +199,40 @@ class LifecycleTest {
     @Test
     fun `a non-bitbox session has no pairing material`() = runBlocking<Unit> {
         val session = HwiSession.ledgerUsb(ReplayHidChannel(fingerprintFixture()))
-        assertFailsWith<HwiException.BadState> { session.bitboxPairing() }
+        try {
+            assertFailsWith<HwiException.BadState> { session.bitboxPairing() }
+        } finally {
+            session.disconnect()
+        }
     }
 
     @Test
     fun `a stalled call can be cancelled and disconnect does not hang`() = runBlocking<Unit> {
-        val channel = StalledHidChannel()
-        val session = HwiSession.ledgerUsb(channel)
-        val call = async(Dispatchers.Default) { session.getMasterFingerprint() }
-        withTimeout(10_000) {
-            while (!channel.reached.get()) delay(5)
-            call.cancel()
-            session.disconnect()
+        val config = NoiseConfig(ByteArray(32) { 7 }, listOf(ByteArray(32) { 9 }))
+        repeat(3) {
+            val channel = StalledHidChannel()
+            val session = HwiSession.bitboxUsb(
+                channel,
+                Network.TESTNET,
+                onPairingCode = {},
+                noiseConfig = config,
+            )
+            try {
+                withTimeout(10_000) {
+                    val call = async { session.unlock(Network.TESTNET) }
+                    channel.reached.await()
+                    call.cancelAndJoin()
+                    val exported = session.bitboxPairing()
+                    assertEquals(config.privkey?.hex(), exported.privkey?.hex())
+                    assertEquals(config.devicePubkeys.map { it.hex() }, exported.devicePubkeys.map { it.hex() })
+                }
+                session.disconnect()
+                session.disconnect()
+                assertFailsWith<HwiException.BadState> { session.unlock(Network.TESTNET) }
+                assertFailsWith<HwiException.BadState> { session.bitboxPairing() }
+            } finally {
+                session.disconnect()
+            }
         }
     }
 }
@@ -179,13 +272,12 @@ private class FailingLink : Link {
 
 /** Accepts writes, then never answers: models a device that stopped responding. */
 private class StalledHidChannel : HidChannel {
-    val reached = AtomicBoolean(false)
+    val reached = CompletableDeferred<Unit>()
 
     override suspend fun send(report: ByteArray): UInt = report.size.toUInt()
 
     override suspend fun receive(maxLen: UInt): ByteArray {
-        reached.set(true)
-        delay(Long.MAX_VALUE)
-        error("unreachable")
+        reached.complete(Unit)
+        awaitCancellation()
     }
 }

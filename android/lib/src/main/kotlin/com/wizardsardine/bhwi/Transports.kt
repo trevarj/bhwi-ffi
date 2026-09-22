@@ -14,11 +14,17 @@ sealed class TransportException(message: String) : kotlin.Exception(message) {
     /** The device went away. Distinct from [Io] because the UI reacts to it differently. */
     class Disconnected : TransportException("device disconnected")
 
-    /** The host aborted the operation. */
+    /** The adapter aborted the operation; distinct from coroutine `CancellationException`. */
     class Cancelled : TransportException("operation cancelled")
 }
 
-/** Raw HID report channel (Ledger / Coldcard / BitBox02 over USB). */
+/**
+ * Raw HID report channel (Ledger / Coldcard / BitBox02 over USB).
+ *
+ * Facade-driven callbacks run in the command's IO context, without fixed worker-thread
+ * identity. Cooperate with cancellation and marshal platform/UI callbacks yourself.
+ * Direct [Link] use retains caller-context execution.
+ */
 interface HidChannel {
     /**
      * Write one HID report; returns the number of bytes written.
@@ -32,7 +38,13 @@ interface HidChannel {
     suspend fun receive(maxLen: UInt): ByteArray
 }
 
-/** Byte stream for Jade, bridged from either USB serial or BLE. */
+/**
+ * Byte stream for Jade, bridged from either USB serial or BLE.
+ *
+ * Facade-driven callbacks run in the command's IO context, without fixed worker-thread
+ * identity. Cooperate with cancellation and marshal platform/UI callbacks yourself.
+ * Direct [Link] use retains caller-context execution.
+ */
 interface SerialStream {
     suspend fun writeAll(data: ByteArray)
 
@@ -47,7 +59,13 @@ interface SerialStream {
     suspend fun read(maxLen: UInt): ByteArray
 }
 
-/** GATT characteristic pair for a Ledger connected over BLE. */
+/**
+ * GATT characteristic pair for a Ledger connected over BLE.
+ *
+ * Facade-driven callbacks run in the command's IO context, without fixed worker-thread
+ * identity. Cooperate with cancellation and marshal platform/UI callbacks yourself.
+ * Direct [Link] use retains caller-context execution.
+ */
 interface BleChannel {
     /** Write one BLE frame (already sized to [mtu]). */
     suspend fun write(data: ByteArray)
@@ -59,7 +77,13 @@ interface BleChannel {
     fun mtu(): UShort
 }
 
-/** HTTP bridge used only for the Jade PIN server exchange (`Content-Type: application/json`). */
+/**
+ * HTTP bridge used only for the Jade PIN server exchange (`Content-Type: application/json`).
+ *
+ * Facade-driven requests run in the command's IO context, without fixed worker-thread
+ * identity. Cooperate with cancellation and marshal platform/UI callbacks yourself.
+ * Direct calls retain caller-context execution.
+ */
 interface HttpBridge {
     suspend fun request(url: String, body: ByteArray): ByteArray
 }

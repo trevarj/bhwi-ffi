@@ -276,11 +276,6 @@ pub(crate) fn map_error(error: bc::Error, kind: DeviceKind, user_action: bool) -
         {
             HwiError::UserRefused
         }
-        bc::Error::InvalidInput(msg) => HwiError::InvalidInput { msg },
-        // The command is missing data this API does not carry (a Ledger wallet policy).
-        bc::Error::MissingCommandInfo(msg) => HwiError::InvalidInput {
-            msg: msg.to_string(),
-        },
         // Coldcard's `refu` reply to sign message / sign tx is not an anticipated
         // response there, so it surfaces as an unexpected-response context string.
         bc::Error::UnexpectedResult(_, ref context)
@@ -288,12 +283,36 @@ pub(crate) fn map_error(error: bc::Error, kind: DeviceKind, user_action: bool) -
         {
             HwiError::UserRefused
         }
-        // Deliberately drops the raw payload: errors must not carry protocol bytes.
-        bc::Error::UnexpectedResult(_, context) => HwiError::Device {
-            msg: format!("unexpected result for {context}"),
+        // The command is missing data this API does not carry (a Ledger wallet policy).
+        bc::Error::MissingCommandInfo(context) => HwiError::InvalidInput {
+            msg: context.to_owned(),
         },
-        other => HwiError::Device {
-            msg: other.to_string(),
+        bc::Error::InvalidInput(_) => HwiError::InvalidInput {
+            msg: format!("{kind:?}: invalid command input"),
+        },
+        bc::Error::Device(_) => HwiError::Device {
+            msg: format!("{kind:?}: device reported an error"),
+        },
+        bc::Error::UnexpectedResult(_, _) => HwiError::Device {
+            msg: format!("{kind:?}: unexpected response"),
+        },
+        bc::Error::Rpc(code, _) => HwiError::Device {
+            msg: format!("{kind:?}: rpc error {code}"),
+        },
+        bc::Error::Serialization(_) => HwiError::Device {
+            msg: format!("{kind:?}: protocol serialization failed"),
+        },
+        bc::Error::UnsupportedDisplayAddress(_) => HwiError::Device {
+            msg: format!("{kind:?}: unsupported address display"),
+        },
+        bc::Error::Encryption(context) => HwiError::Device {
+            msg: format!("encryption error: {context}"),
+        },
+        bc::Error::Request(context) => HwiError::Device {
+            msg: format!("request error: {context}"),
+        },
+        bc::Error::NoErrorOrResult => HwiError::Device {
+            msg: "no error or result returned".to_owned(),
         },
     }
 }
@@ -305,7 +324,7 @@ pub(crate) fn parse_path(path: &str) -> Result<DerivationPath, HwiError> {
 pub(crate) fn decode_psbt(psbt_base64: &str) -> Result<Psbt, HwiError> {
     let raw = Base64::decode_vec(psbt_base64.trim())
         .map_err(|_| HwiError::invalid("PSBT is not valid base64"))?;
-    Psbt::deserialize(&raw).map_err(|e| HwiError::invalid(format!("invalid PSBT: {e}")))
+    Psbt::deserialize(&raw).map_err(|_| HwiError::invalid("invalid PSBT"))
 }
 
 pub(crate) fn encode_psbt(psbt: &Psbt) -> String {
@@ -382,16 +401,30 @@ mod tests {
     }
 
     #[test]
-    fn errors_never_leak_protocol_bytes() {
-        let error = map_error(
-            bc::Error::UnexpectedResult(vec![0xde, 0xad, 0xbe, 0xef], "get_xpub".to_string()),
-            DeviceKind::Jade,
-            false,
-        );
-        let HwiError::Device { msg } = error else {
-            panic!("expected a device error, got {error:?}");
-        };
-        assert_eq!(msg, "unexpected result for get_xpub");
+    fn errors_never_leak_untrusted_strings() {
+        let canary = "ffi-redaction-canary";
+        for source in [
+            bc::Error::Device(canary.into()),
+            bc::Error::Serialization(canary.into()),
+            bc::Error::InvalidInput(canary.into()),
+            bc::Error::UnsupportedDisplayAddress(canary.into()),
+            bc::Error::Rpc(-32602, Some(canary.into())),
+            bc::Error::UnexpectedResult(canary.as_bytes().to_vec(), canary.into()),
+        ] {
+            let invalid_input = matches!(&source, bc::Error::InvalidInput(_));
+            let rpc = matches!(&source, bc::Error::Rpc(..));
+            let error = map_error(source, DeviceKind::Coldcard, false);
+            let msg = match &error {
+                HwiError::InvalidInput { msg } if invalid_input => msg,
+                HwiError::Device { msg } if !invalid_input => msg,
+                _ => panic!("unexpected error category: {error:?}"),
+            };
+            assert!(!msg.contains(canary), "leaked error field: {error:?}");
+            assert!(!error.to_string().contains(canary));
+            if rpc {
+                assert!(msg.contains("-32602"), "RPC code was discarded");
+            }
+        }
     }
 
     #[test]

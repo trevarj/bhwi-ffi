@@ -2,6 +2,7 @@ package com.wizardsardine.bhwi
 
 import kotlin.test.assertFailsWith
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Test
 import uniffi.bhwi_ffi.AddressFormat
 import uniffi.bhwi_ffi.HwiException
@@ -54,6 +55,21 @@ class HelpersTest {
     }
 
     @Test
+    fun `descriptor errors omit invalid origin input`() {
+        val error = assertFailsWith<HwiException.InvalidInput> {
+            buildSinglesigDescriptor(
+                xpub,
+                fingerprint,
+                "m/4242424242",
+                AddressFormat.NATIVE_SEGWIT,
+                Network.TESTNET,
+            )
+        }
+        assertFalse(error.msg.contains("4242424242"))
+        assertFalse(error.toString().contains("4242424242"))
+    }
+
+    @Test
     fun `derives both branches`() {
         assertEquals(
             listOf(
@@ -82,6 +98,16 @@ class HelpersTest {
     }
 
     @Test
+    fun `derive errors omit invalid descriptor input`() {
+        val canary = "ffi-redaction-canary"
+        val error = assertFailsWith<HwiException.InvalidInput> {
+            deriveAddresses("wpkh($xpub/$canary/*)", Network.TESTNET, false, 0u, 1u)
+        }
+        assertFalse(error.msg.contains(canary))
+        assertFalse(error.toString().contains(canary))
+    }
+
+    @Test
     fun `psbt summary reports amounts and fee`() {
         val summary = psbtSummary(psbt, Network.TESTNET)
         assertEquals(1, summary.inputs.size)
@@ -98,7 +124,11 @@ class HelpersTest {
     }
 
     @Test
-    fun `psbt summary rejects garbage`() {
-        assertFailsWith<HwiException.InvalidInput> { psbtSummary("not base64!", Network.TESTNET) }
+    fun `psbt summary errors omit invalid binary key data`() {
+        val error = assertFailsWith<HwiException.InvalidInput> {
+            psbtSummary("cHNidP8FAN6tvu8A", Network.TESTNET)
+        }
+        assertFalse(error.msg.contains("deadbeef"))
+        assertFalse(error.toString().contains("deadbeef"))
     }
 }

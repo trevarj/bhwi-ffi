@@ -1,13 +1,18 @@
 package com.wizardsardine.bhwi.sample
 
+import android.os.Looper
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.wizardsardine.bhwi.HidChannel
 import com.wizardsardine.bhwi.HwiSession
 import com.wizardsardine.bhwi.TransportException
 import java.util.ArrayDeque
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertSame
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -21,6 +26,7 @@ import org.junit.runner.RunWith
 class FingerprintReplayTest {
     @Test
     fun masterFingerprintReplaysTheRecordedTranscript() = runBlocking<Unit> {
+        assertNotSame(Looper.getMainLooper().thread, Thread.currentThread())
         val json = InstrumentationRegistry.getInstrumentation()
             .context
             .assets
@@ -30,7 +36,11 @@ class FingerprintReplayTest {
         val channel = ReplayHidChannel(strings("writes", json), strings("reads", json))
         val session = HwiSession.ledgerUsb(channel)
         try {
-            assertEquals(expected(json), session.getMasterFingerprint())
+            withContext(Dispatchers.Main) {
+                assertSame(Looper.getMainLooper().thread, Thread.currentThread())
+                assertEquals(expected(json), session.getMasterFingerprint())
+                assertSame(Looper.getMainLooper().thread, Thread.currentThread())
+            }
         } finally {
             session.disconnect()
         }
@@ -54,6 +64,7 @@ private class ReplayHidChannel(writes: List<String>, reads: List<String>) : HidC
     private val lock = Any()
 
     override suspend fun send(report: ByteArray): UInt = synchronized(lock) {
+        assertNotSame(Looper.getMainLooper().thread, Thread.currentThread())
         val actual = report.joinToString("") { "%02x".format(it) }
         val expected = writes.pollFirst()
         if (expected != actual) {
@@ -63,6 +74,7 @@ private class ReplayHidChannel(writes: List<String>, reads: List<String>) : HidC
     }
 
     override suspend fun receive(maxLen: UInt): ByteArray = synchronized(lock) {
+        assertNotSame(Looper.getMainLooper().thread, Thread.currentThread())
         val next = reads.pollFirst() ?: throw TransportException.Disconnected()
         next.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
             .copyOf(minOf(next.length / 2, maxLen.toInt()))

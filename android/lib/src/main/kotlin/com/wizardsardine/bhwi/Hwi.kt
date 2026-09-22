@@ -1,5 +1,8 @@
 package com.wizardsardine.bhwi
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 import uniffi.bhwi_ffi.HwiCommand
 import uniffi.bhwi_ffi.HwiException
 import uniffi.bhwi_ffi.HwiResponse
@@ -14,6 +17,9 @@ import uniffi.bhwi_ffi.Transmit
  *
  * This is the raw layer. Use it when you want to own the `Interp` and the state handles
  * yourself; [HwiSession] is the same loop with the per-device wiring already done.
+ *
+ * [runCommand] is main-safe. Generated UniFFI constructors, methods and helpers remain
+ * synchronous and must be called on a worker.
  */
 object Hwi {
     /**
@@ -21,6 +27,10 @@ object Hwi {
      *
      * Bundled so the two can never be passed apart — polling without a sink would silently
      * swallow the code, and a sink without the handle could never fire.
+     *
+     * [onCode] runs synchronously in the command's IO context, before the next protocol
+     * payload, without fixed worker-thread identity. Cooperate with cancellation and
+     * marshal platform/UI callbacks yourself; the loop launches no callback coroutines.
      */
     class Pairing(val noise: NoiseHandle, val onCode: (String) -> Unit)
 
@@ -37,17 +47,24 @@ object Hwi {
         http: HttpBridge? = null,
         pairing: Pairing? = null,
     ): HwiResponse = interp.use {
-        var transmit = interp.start(cmd)
-        while (true) {
-            val reply = deliver(transmit, link, http)
-            val next = interp.exchange(reply)
-            // During a first-time BitBox pair the code becomes known just before the
-            // verification payload goes out, so surface it before sending that payload:
-            // the device is already waiting for the user to compare it.
-            pairing?.let { p -> p.noise.takePairingCode()?.let(p.onCode) }
-            transmit = next ?: break
+        withContext(Dispatchers.IO) {
+            ensureActive()
+            var transmit = interp.start(cmd)
+            while (true) {
+                ensureActive()
+                val reply = deliver(transmit, link, http)
+                ensureActive()
+                val next = interp.exchange(reply)
+                ensureActive()
+                // During a first-time BitBox pair the code becomes known just before the
+                // verification payload goes out, so surface it before sending that payload:
+                // the device is already waiting for the user to compare it.
+                pairing?.let { p -> p.noise.takePairingCode()?.let(p.onCode) }
+                transmit = next ?: break
+            }
+            ensureActive()
+            interp.end()
         }
-        interp.end()
     }
 
     /** Internal so the routing decision can be tested without a device. */
