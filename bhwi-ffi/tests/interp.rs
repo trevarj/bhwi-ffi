@@ -169,6 +169,29 @@ fn a_protocol_failure_retires_the_interpreter() {
 }
 
 #[test]
+fn coldcard_protocol_errors_do_not_leak_and_release_the_lease() {
+    let canary = "ffi-redaction-canary";
+    let encryption = ColdcardEncryption::new();
+    let interp = Interp::new_coldcard(encryption.clone()).expect("interpreter");
+    interp
+        .start(HwiCommand::Unlock {
+            network: Network::Testnet,
+        })
+        .expect("start");
+    let error = interp
+        .exchange(format!("zzzz{canary}").into_bytes())
+        .expect_err("unknown Coldcard response");
+    let HwiError::Device { ref msg } = error else {
+        panic!("expected a device error, got {error:?}");
+    };
+    assert!(!msg.contains(canary), "leaked error field: {error:?}");
+    assert!(!error.to_string().contains(canary));
+    assert!(msg.contains("Coldcard"), "missing device context");
+    assert!(matches!(interp.end(), Err(HwiError::BadState { .. })));
+    Interp::new_coldcard(encryption).expect("lease released after protocol failure");
+}
+
+#[test]
 fn invalid_input_leaves_the_interpreter_usable() {
     let interp = Interp::new_ledger();
     assert!(matches!(
@@ -178,7 +201,26 @@ fn invalid_input_leaves_the_interpreter_usable() {
         }),
         Err(HwiError::InvalidInput { .. })
     ));
-    assert!(interp.start(HwiCommand::GetMasterFingerprint).is_ok());
+    let error = interp
+        .start(HwiCommand::SignPsbt {
+            psbt_base64: "cHNidP8FAN6tvu8A".to_string(),
+        })
+        .expect_err("invalid PSBT key data");
+    let HwiError::InvalidInput { ref msg } = error else {
+        panic!("expected invalid input, got {error:?}");
+    };
+    assert!(!msg.contains("deadbeef"), "leaked PSBT key data: {error:?}");
+    assert!(!error.to_string().contains("deadbeef"));
+    let response = drive(
+        &interp,
+        HwiCommand::GetMasterFingerprint,
+        vec![fingerprint_reply()],
+    )
+    .expect("fingerprint after invalid input");
+    let HwiResponse::Fingerprint { hex } = response else {
+        panic!("expected a fingerprint");
+    };
+    assert_eq!(hex, FINGERPRINT);
 }
 
 #[test]
@@ -254,13 +296,16 @@ fn a_leased_noise_handle_refuses_a_second_interpreter() {
 #[test]
 fn dropping_an_interpreter_releases_the_lease() {
     let encryption = ColdcardEncryption::new();
+    let weak = Arc::downgrade(&encryption);
     let interp = Interp::new_coldcard(encryption.clone()).expect("interpreter");
     assert!(matches!(
         Interp::new_coldcard(encryption.clone()),
         Err(HwiError::BadState { .. })
     ));
     drop(interp);
-    assert!(Interp::new_coldcard(encryption).is_ok());
+    let next = Interp::new_coldcard(encryption).expect("lease released");
+    drop(next);
+    assert!(weak.upgrade().is_none());
 }
 
 /// The device's answer to `ncry`: its ephemeral pubkey, the master fingerprint and an

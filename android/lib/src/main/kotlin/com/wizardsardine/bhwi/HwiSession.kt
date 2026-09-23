@@ -1,8 +1,11 @@
 package com.wizardsardine.bhwi
 
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import uniffi.bhwi_ffi.AddressFormat
 import uniffi.bhwi_ffi.ColdcardEncryption
 import uniffi.bhwi_ffi.HwiCommand
@@ -21,8 +24,12 @@ import uniffi.bhwi_ffi.NoiseHandle
  * survive a command (BitBox02 noise pairing, Coldcard link encryption) is owned here, and
  * the mutex is what keeps a second command from trying to lease it mid-flight.
  *
+ * Suspend commands and pairing export are main-safe. The synchronous factories remain
+ * worker-only, as do generated UniFFI constructors, methods and helpers.
+ *
  * Errors come through as they are: `HwiException` from the protocol layer,
- * [TransportException] from the host transport.
+ * [TransportException] from the host transport. Coroutine cancellation remains
+ * `CancellationException`; [TransportException.Cancelled] is a separate adapter error.
  */
 class HwiSession private constructor(
     private val newInterp: () -> Interp,
@@ -68,18 +75,25 @@ class HwiSession private constructor(
      * The BitBox02 pairing material to persist, so the next session skips the on-screen
      * confirmation. Call it after a successful [unlock]; pass it back as `noiseConfig`.
      */
-    suspend fun bitboxPairing(): NoiseConfig = lock.withLock {
-        requireOpen()
-        val handle = noise ?: throw HwiException.BadState("this session has no BitBox02 pairing state")
-        handle.export()
+    suspend fun bitboxPairing(): NoiseConfig = withContext(Dispatchers.IO) {
+        lock.withLock {
+            ensureActive()
+            requireOpen()
+            val handle = noise ?: throw HwiException.BadState("this session has no BitBox02 pairing state")
+            handle.export()
+        }
     }
 
     /**
-     * Idempotent. Releases the device state handles; later calls fail with
-     * `HwiException.BadState`.
+     * Idempotent. Closes the facade and releases its state-handle references; later calls
+     * fail with `HwiException.BadState`.
      *
-     * The transport itself belongs to the caller and is left alone. Deliberately not
-     * suspending and not behind the mutex, so it never blocks on an in-flight command.
+     * The transport belongs to the caller and is left alone. This synchronous method is
+     * outside the command mutex: it does not own/cancel an operation Job, unblock platform
+     * I/O, or guarantee that an in-flight command cannot finish.
+     *
+     * For teardown, cancel the operation, unblock caller-owned platform I/O if needed,
+     * join the operation, disconnect, then dispose the transport.
      */
     fun disconnect() {
         if (closed.compareAndSet(false, true)) {
@@ -88,17 +102,20 @@ class HwiSession private constructor(
         }
     }
 
-    private suspend fun run(cmd: HwiCommand): HwiResponse = lock.withLock {
-        requireOpen()
-        val pairing = noise?.let { handle -> onPairingCode?.let { Hwi.Pairing(handle, it) } }
-        try {
-            Hwi.runCommand(newInterp(), cmd, link, http, pairing)
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            throw e // extends IllegalStateException; must not be remapped
-        } catch (e: IllegalStateException) {
-            // disconnect() racing an in-flight command destroys the state handles under
-            // the loop; surface that as the typed post-disconnect error, not a uniffi ISE.
-            if (closed.get()) throw HwiException.BadState("session is disconnected") else throw e
+    private suspend fun run(cmd: HwiCommand): HwiResponse = withContext(Dispatchers.IO) {
+        lock.withLock {
+            ensureActive()
+            requireOpen()
+            val pairing = noise?.let { handle -> onPairingCode?.let { Hwi.Pairing(handle, it) } }
+            try {
+                Hwi.runCommand(newInterp(), cmd, link, http, pairing)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e // extends IllegalStateException; must not be remapped
+            } catch (e: IllegalStateException) {
+                // disconnect() racing an in-flight command destroys the state handles under
+                // the loop; surface that as the typed post-disconnect error, not a uniffi ISE.
+                if (closed.get()) throw HwiException.BadState("session is disconnected") else throw e
+            }
         }
     }
 
@@ -110,6 +127,10 @@ class HwiSession private constructor(
     private fun unexpected(): Nothing =
         throw HwiException.Internal("the device answered with an unexpected response kind")
 
+    /**
+     * Synchronous, worker-only factories. [coldcardUsb] generates native key material and
+     * [bitboxUsb] restores native state; the other factories defer native initialization.
+     */
     companion object {
         fun ledgerUsb(hid: HidChannel): HwiSession =
             HwiSession({ Interp.newLedger() }, LedgerHidLink(hid))

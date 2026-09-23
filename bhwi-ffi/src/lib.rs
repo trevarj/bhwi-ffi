@@ -87,7 +87,13 @@ impl From<AddressFormat> for bhwi::bitcoin::AddressType {
     }
 }
 
-/// Errors surfaced to foreign-language hosts. Messages never carry raw protocol payloads or key material.
+/// Structured errors surfaced to foreign-language hosts. Messages produced by this
+/// crate do not carry raw protocol payloads or key material.
+///
+/// This guarantee applies only to `HwiError`. UniFFI catches unwinding panics and
+/// reports unexpected failures separately (as Kotlin `InternalException`), whose
+/// messages may retain panic text. It does not make aborts or out-of-memory failures
+/// recoverable.
 ///
 /// I/O failures have no variant here: the host owns every transport, so it reports
 /// transport and HTTP problems in its own native error type.

@@ -75,8 +75,8 @@ open class ReplayHidChannel(fixture: Fixture) : HidChannel {
     private val writes = ArrayDeque(fixture.writes)
     private val reads = ArrayDeque(fixture.reads)
 
-    // Commands are serialised by the session, but the queues are still touched from
-    // whichever dispatcher the caller used.
+    // Commands are serialised by the session, but its IO context can use different worker
+    // threads; check() also runs in the test caller's context.
     private val lock = Any()
 
     override suspend fun send(report: ByteArray): UInt = synchronized(lock) {

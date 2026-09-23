@@ -44,8 +44,8 @@ dependencies {
     // Deliberately the published artifact from mavenLocal, not project(":lib"): this is
     // what proves the consumption path an app would take.
     implementation("com.wizardsardine:bhwi-ffi-android:0.1.0-SNAPSHOT")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
-    androidTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 }
