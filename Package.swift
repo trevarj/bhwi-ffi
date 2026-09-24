@@ -21,7 +21,8 @@ let package = Package(
     .testTarget(
       name: "BhwiTests",
       dependencies: ["Bhwi"],
-      path: "ios/Tests/BhwiTests"
+      path: "ios/Tests/BhwiTests",
+      resources: [.process("Fixtures")]
     ),
   ]
 )

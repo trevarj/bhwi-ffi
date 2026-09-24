@@ -1,6 +1,8 @@
 import Foundation
 
 /// One logical request/response exchange over caller-owned I/O.
+/// Serialize exchanges; links are not safe for concurrent commands. Cancellation is
+/// cooperative: adapters must unblock their own platform I/O when a task is cancelled.
 public protocol Link: AnyObject {
   func exchange(payload: Data, encrypted: Bool) async throws -> Data
 }
@@ -19,6 +21,9 @@ public final class LedgerHidLink: Link {
   }
 
   public func exchange(payload: Data, encrypted _: Bool) async throws -> Data {
+    guard payload.count <= 0xffff else {
+      throw TransportError.io("ledger: APDU longer than the HID protocol allows")
+    }
     let payload = [UInt8](payload)
     var framed = [UInt8](repeating: 0, count: payload.count + 2)
     framed[0] = UInt8((payload.count >> 8) & 0xff)
@@ -44,7 +49,6 @@ public final class LedgerHidLink: Link {
       sequence += 1
     }
 
-    var buffer = [UInt8](repeating: 0, count: hidReportLength)
     var answer: [UInt8] = []
     var wantedSequence = 0
     var expected = 0
@@ -58,22 +62,24 @@ public final class LedgerHidLink: Link {
       else {
         throw TransportError.io("ledger: incomplete HID header")
       }
-      buffer.replaceSubrange(0..<read.count, with: read)
-      guard be16(buffer, 0) == Self.channelID else {
+      guard be16(read, 0) == Self.channelID else {
         throw TransportError.io("ledger: invalid channel")
       }
-      guard buffer[2] == Self.tag else { throw TransportError.io("ledger: invalid tag") }
-      guard be16(buffer, 3) == wantedSequence else {
+      guard read[2] == Self.tag else { throw TransportError.io("ledger: invalid tag") }
+      guard be16(read, 3) == wantedSequence else {
         throw TransportError.io("ledger: invalid sequence idx")
       }
 
       var position = 5
       if wantedSequence == 0 {
-        expected = be16(buffer, 5)
+        expected = be16(read, 5)
         position = 7
       }
       let count = min(hidReportLength - position, expected - answer.count)
-      if count > 0 { answer.append(contentsOf: buffer[position..<(position + count)]) }
+      guard read.count >= position + count else {
+        throw TransportError.io("ledger: incomplete HID payload")
+      }
+      if count > 0 { answer.append(contentsOf: read[position..<(position + count)]) }
       if answer.count >= expected { return Data(answer) }
       wantedSequence += 1
     }
@@ -91,6 +97,9 @@ public final class ColdcardHidLink: Link {
   }
 
   public func exchange(payload: Data, encrypted: Bool) async throws -> Data {
+    guard !payload.isEmpty, payload.count <= Self.maximumResponseLength else {
+      throw TransportError.io("coldcard: request exceeds the protocol message limit")
+    }
     let payload = [UInt8](payload)
     var report = [UInt8](repeating: 0, count: hidReportLength)
     let chunks = (payload.count + Self.chunk - 1) / Self.chunk
@@ -116,7 +125,11 @@ public final class ColdcardHidLink: Link {
       }
       let flag = Int(report[0])
       let fram = first && Array(report[1..<5]) == Self.fram
-      answer.append(contentsOf: report[1..<(1 + (flag & 0x3f))])
+      let count = flag & 0x3f
+      guard count <= Self.maximumResponseLength - answer.count else {
+        throw TransportError.io("coldcard: response exceeds the protocol message limit")
+      }
+      answer.append(contentsOf: report[1..<(1 + count)])
       first = false
       if flag & 0x80 != 0 || fram { return Data(answer) }
     }
@@ -124,6 +137,9 @@ public final class ColdcardHidLink: Link {
 
   private static let chunk = 63
   private static let fram = Array("fram".utf8)
+  // ckcc-protocol/ckcc/constants.py MAX_MSG_LEN; BHWI uses 2048-byte file chunks.
+  // ncry v1 uses AES-CTR, so encryption does not expand the response.
+  private static let maximumResponseLength = 2048 + 12
 }
 
 enum U2f {
@@ -179,19 +195,30 @@ enum U2f {
       throw TransportError.io("bitbox: wrong U2F command")
     }
     let length = be16(bytes, 5)
+    guard length <= maximumMessageLength else {
+      throw TransportError.io("bitbox: message needs more U2F frames than allowed")
+    }
     guard bytes.count >= frameCount(length) * frameLength else { return nil }
 
     var output = [UInt8](repeating: 0, count: length)
     var count = min(initialDataLength, length)
     output.replaceSubrange(0..<count, with: bytes[7..<(7 + count)])
     var written = count
-    var from = 7 + count
+    var from = frameLength
+    var sequence: UInt8 = 0
     while written < length {
+      guard readBE32(bytes, at: from) == channelID else {
+        throw TransportError.io("bitbox: wrong U2F continuation channel id")
+      }
+      guard bytes[from + 4] == sequence else {
+        throw TransportError.io("bitbox: wrong U2F continuation sequence")
+      }
       count = min(continuationDataLength, length - written)
       output.replaceSubrange(
         written..<(written + count), with: bytes[(from + 5)..<(from + 5 + count)])
       written += count
-      from += 5 + count
+      from += frameLength
+      sequence += 1
     }
     return Data(output)
   }
@@ -237,6 +264,7 @@ public final class BitBoxHidLink: Link {
     let encoded = try U2f.encode(message)
     var offset = 0
     while offset < encoded.count {
+      try Task.checkCancellation()
       let frame = encoded.subdata(in: offset..<(offset + U2f.frameLength))
       guard try await channel.send(frame) >= frame.count else {
         throw TransportError.io("bitbox: could not send the whole HID report")
@@ -266,15 +294,22 @@ public final class BitBoxHidLink: Link {
 
 public final class JadeSerialLink: Link {
   private let stream: SerialStream
+  private var pending = Data()
 
   public init(stream: SerialStream) {
     self.stream = stream
   }
 
   public func exchange(payload: Data, encrypted _: Bool) async throws -> Data {
+    try Task.checkCancellation()
     try await stream.writeAll(payload)
-    var buffer = Data()
+    var buffer = pending
+    pending.removeAll()
     while true {
+      if let length = try Cbor.valueLength(buffer) {
+        pending = Data(buffer.dropFirst(length))
+        return Data(buffer.prefix(length))
+      }
       try Task.checkCancellation()
       let chunk = try await stream.read(maxLength: Self.chunkLength)
       guard chunk.count <= Self.chunkLength else {
@@ -283,8 +318,10 @@ public final class JadeSerialLink: Link {
       guard !chunk.isEmpty else {
         throw TransportError.io("stream ended before complete CBOR message")
       }
+      guard chunk.count <= Cbor.maximumMessageLength + Self.chunkLength - 1 - buffer.count else {
+        throw TransportError.io("jade: response exceeds the protocol message limit")
+      }
       buffer.append(chunk)
-      if try Cbor.isComplete(buffer) { return buffer }
     }
   }
 
@@ -353,6 +390,9 @@ public final class LedgerBleLink: Link {
   }
 
   private func frameSize() async throws -> Int {
+    guard channel.mtu >= Self.minimumMtu else {
+      throw TransportError.io("ledger: BLE channel must support at least 20-byte writes")
+    }
     if let negotiatedFrameSize { return negotiatedFrameSize }
     let size = max(min(try await inferMtu(), channel.mtu), Self.minimumMtu)
     negotiatedFrameSize = size

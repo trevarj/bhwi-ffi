@@ -2,12 +2,23 @@ import Foundation
 
 /// Structural CBOR walk used only to find the end of one Jade response.
 enum Cbor {
-  static func isComplete(_ data: Data) throws -> Bool {
+  // Jade MAX_OUTPUT_MSG_SIZE, including the larger camera-debug configuration.
+  // https://github.com/Blockstream/Jade/blob/6f46b8a8b2c602fd18d6835eab64e5e5e1e7ee1a/main/process.h
+  static let maximumMessageLength = 3 * 1024 * 30
+
+  static func valueLength(_ data: Data) throws -> Int? {
     let bytes = [UInt8](data)
-    return try endOfValue(bytes, at: 0, end: bytes.count) != nil
+    let length = try endOfValue(bytes, at: 0, end: bytes.count)
+    guard (length ?? data.count) <= maximumMessageLength else {
+      throw TransportError.io("jade: CBOR response exceeds the protocol message limit")
+    }
+    return length
   }
 
-  static func endOfValue(_ bytes: [UInt8], at: Int, end: Int) throws -> Int? {
+  static func endOfValue(_ bytes: [UInt8], at: Int, end: Int, depth: Int = 0) throws -> Int? {
+    guard depth <= 64 else {
+      throw TransportError.io("jade: CBOR nesting exceeds 64 levels")
+    }
     guard at < end else { return nil }
     let initial = Int(bytes[at])
     let major = initial >> 5
@@ -29,13 +40,27 @@ enum Cbor {
       value = read
     case 31:
       switch major {
-      case 2, 3: return try endOfChunks(bytes, from: position, end: end, major: major)
-      case 4, 5: return try endOfItems(bytes, from: position, end: end)
+      case 2, 3:
+        return try endOfChunks(bytes, from: position, end: end, major: major, depth: depth)
+      case 4, 5:
+        return try endOfItems(bytes, from: position, end: end, isMap: major == 5, depth: depth)
       default:
         throw TransportError.io("jade: malformed CBOR, indefinite length for major type \(major)")
       }
     default:
       throw TransportError.io("jade: malformed CBOR, reserved additional information \(info)")
+    }
+    guard position <= maximumMessageLength else {
+      throw TransportError.io("jade: CBOR response exceeds the protocol message limit")
+    }
+
+    // Strings need one byte per unit, arrays at least one per item, maps two per pair.
+    // Reject impossible declarations now instead of waiting for an unbounded body.
+    if (2...5).contains(major) {
+      let minimumBytesPerItem = major == 5 ? 2 : 1
+      guard value <= UInt64((maximumMessageLength - position) / minimumBytesPerItem) else {
+        throw TransportError.io("jade: CBOR declared length exceeds the protocol message limit")
+      }
     }
 
     switch major {
@@ -46,12 +71,12 @@ enum Cbor {
       return position + Int(value)
     case 4:
       guard value <= UInt64(end - position) else { return nil }
-      return try endOfItems(bytes, from: position, end: end, count: Int(value))
+      return try endOfItems(bytes, from: position, end: end, count: Int(value), depth: depth)
     case 5:
       guard value <= UInt64((end - position) / 2) else { return nil }
-      return try endOfItems(bytes, from: position, end: end, count: Int(value) * 2)
+      return try endOfItems(bytes, from: position, end: end, count: Int(value) * 2, depth: depth)
     default:
-      return try endOfValue(bytes, at: position, end: end)
+      return try endOfValue(bytes, at: position, end: end, depth: depth + 1)
     }
   }
 
@@ -59,7 +84,8 @@ enum Cbor {
     _ bytes: [UInt8],
     from: Int,
     end: Int,
-    major: Int
+    major: Int,
+    depth: Int
   ) throws -> Int? {
     var position = from
     while true {
@@ -72,7 +98,9 @@ enum Cbor {
       guard initial & 0x1f != 31 else {
         throw TransportError.io("jade: malformed CBOR, nested indefinite string")
       }
-      guard let next = try endOfValue(bytes, at: position, end: end) else { return nil }
+      guard let next = try endOfValue(bytes, at: position, end: end, depth: depth + 1) else {
+        return nil
+      }
       position = next
     }
   }
@@ -81,15 +109,26 @@ enum Cbor {
     _ bytes: [UInt8],
     from: Int,
     end: Int,
-    count: Int? = nil
+    count: Int? = nil,
+    isMap: Bool = false,
+    depth: Int
   ) throws -> Int? {
     var position = from
     var left = count
+    var items = 0
     while left != 0 {
       guard position < end else { return nil }
-      if count == nil, bytes[position] == 0xff { return position + 1 }
-      guard let next = try endOfValue(bytes, at: position, end: end) else { return nil }
+      if count == nil, bytes[position] == 0xff {
+        guard !isMap || items.isMultiple(of: 2) else {
+          throw TransportError.io("jade: malformed CBOR, map key without a value")
+        }
+        return position + 1
+      }
+      guard let next = try endOfValue(bytes, at: position, end: end, depth: depth + 1) else {
+        return nil
+      }
       position = next
+      items += 1
       if let current = left { left = current - 1 }
     }
     return position

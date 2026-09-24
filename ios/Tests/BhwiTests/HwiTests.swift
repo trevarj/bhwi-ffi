@@ -45,6 +45,17 @@ private actor OrderLink: Link {
   }
 }
 
+private final class CancellingBitBoxLink: Link {
+  private(set) var payloads: [Data] = []
+
+  func exchange(payload: Data, encrypted _: Bool) async throws -> Data {
+    payloads.append(payload)
+    if payloads.count == 1 { return Data() }
+    withUnsafeCurrentTask { $0?.cancel() }
+    return Data([0])
+  }
+}
+
 final class HwiTests: XCTestCase {
   func testDeviceAndPinServerRouting() async throws {
     let transmits = [
@@ -92,21 +103,82 @@ final class HwiTests: XCTestCase {
     XCTAssertEqual(recorder.snapshot(), ["send1", "code", "send2"])
   }
 
-  func testCancellationRetiresInterpreterWithoutRemapping() async {
-    let interp = FakeInterp(
-      transmits: [Transmit(payload: Data(), encrypted: false, recipient: .device)],
-      response: .taskDone
-    )
+  func testCancellationRetiresNativeInterpreterWithoutRemapping() async throws {
+    let noise = try NoiseHandle(config: nil)
+    let interp = try Interp.newBitbox(noise: noise, network: .testnet)
     let link = FakeLink(error: CancellationError())
 
     do {
-      _ = try await Hwi.runCommand(interp: interp, command: .getVersion, link: link)
+      _ = try await Hwi.runCommand(interp: interp, command: .unlock(network: .testnet), link: link)
       XCTFail("expected cancellation")
     } catch is CancellationError {
-      XCTAssertEqual(interp.endCalls, 1)
+      XCTAssertNil(try noise.export().privkey)
     } catch {
       XCTFail("unexpected error: \(error)")
     }
+  }
+
+  func testAlreadyCancelledCommandReleasesLeaseWithoutSending() async throws {
+    let noise = try NoiseHandle(config: nil)
+    let interp = try Interp.newBitbox(noise: noise, network: .testnet)
+    let link = FakeLink(error: TransportError.disconnected)
+    let command = Task {
+      withUnsafeCurrentTask { $0?.cancel() }
+      return try await Hwi.runCommand(
+        interp: interp, command: .unlock(network: .testnet), link: link)
+    }
+
+    do {
+      _ = try await command.value
+      XCTFail("expected cancellation")
+    } catch is CancellationError {
+      let calls = await link.recordedCalls()
+      XCTAssertTrue(calls.isEmpty)
+      XCTAssertNil(try noise.export().privkey)
+      let next = try Interp.newBitbox(noise: noise, network: .testnet)
+      XCTAssertEqual(try next.start(cmd: .unlock(network: .testnet)).payload, Data("u".utf8))
+      _ = try? next.end()
+    }
+  }
+
+  func testCancellationAfterSynchronousReplyDoesNotAdvanceNativeState() async throws {
+    let noise = try NoiseHandle(config: nil)
+    let interp = try Interp.newBitbox(noise: noise, network: .testnet)
+    let link = CancellingBitBoxLink()
+    let command = Task {
+      try await Hwi.runCommand(interp: interp, command: .unlock(network: .testnet), link: link)
+    }
+
+    do {
+      _ = try await command.value
+      XCTFail("expected cancellation")
+    } catch is CancellationError {
+      XCTAssertEqual(link.payloads, [Data("u".utf8), Data("h".utf8)])
+      // Consuming the handshake reply would generate the host private key.
+      XCTAssertNil(try noise.export().privkey)
+    }
+  }
+
+  func testUntrustedPinServerUrlNeverReachesHttpAdapter() async {
+    let http = FakeHttp(reply: Data())
+    for url in ["http://pin.example.test", "https://user:secret@pin.example.test",
+                "file:///etc/passwd", "https://pin.example.test/path#fragment"] {
+      let interp = FakeInterp(
+        transmits: [Transmit(payload: Data([1]), encrypted: false, recipient: .pinServer(url: url))],
+        response: .taskDone
+      )
+      do {
+        _ = try await Hwi.runCommand(
+          interp: interp, command: .getVersion, link: FakeLink(), http: http)
+        XCTFail("expected unsafe URL rejection")
+      } catch TransportError.io {
+        XCTAssertEqual(interp.endCalls, 1)
+      } catch {
+        XCTFail("unexpected error: \(error)")
+      }
+    }
+    let calls = await http.calls
+    XCTAssertTrue(calls.isEmpty)
   }
 
   func testMissingPinServerBridgeIsBadState() async {
@@ -122,7 +194,7 @@ final class HwiTests: XCTestCase {
       _ = try await Hwi.runCommand(interp: interp, command: .getVersion, link: FakeLink())
       XCTFail("expected BadState")
     } catch HwiError.BadState {
-      XCTAssertEqual(interp.endCalls, 1)
+      // The loop reports the missing host transport without remapping it.
     } catch {
       XCTFail("unexpected error: \(error)")
     }

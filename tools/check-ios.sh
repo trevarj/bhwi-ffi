@@ -5,7 +5,14 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 
-./tools/build-ios.sh
+if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
+  echo "check-ios.sh requires Apple Silicon macOS for the arm64 simulator slice" >&2
+  exit 1
+fi
+for tool in xcodebuild xcrun; do
+  command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
+done
+xcrun --sdk iphonesimulator --show-sdk-path >/dev/null
 
 if [[ -n ${BHWI_IOS_DESTINATION:-} ]]; then
   destination=$BHWI_IOS_DESTINATION
@@ -17,6 +24,8 @@ else
   fi
   destination="platform=iOS Simulator,id=$udid"
 fi
+
+bash ./tools/build-ios.sh
 
 echo "==> XCTest ($destination)"
 xcodebuild -scheme Bhwi -destination "$destination" test

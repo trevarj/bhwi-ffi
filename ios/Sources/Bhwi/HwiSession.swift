@@ -8,7 +8,7 @@ public actor HwiSession {
   private var noise: NoiseHandle?
   private let onPairingCode: ((String) -> Void)?
   private var commandRunning = false
-  private var commandWaiters: [CheckedContinuation<Void, Never>] = []
+  private var commandWaiters: [(UUID, CheckedContinuation<Void, Error>)] = []
 
   private init(
     makeInterp: @escaping () throws -> Interp,
@@ -76,8 +76,9 @@ public actor HwiSession {
 
   /// Export after successful BitBox unlock and persist in the caller's secure storage.
   public func bitboxPairing() async throws -> NoiseConfig {
-    await acquireCommand()
+    try await acquireCommand()
     defer { releaseCommand() }
+    try Task.checkCancellation()
     guard makeInterp != nil else { throw HwiError.BadState(msg: "session is disconnected") }
     guard let noise else {
       throw HwiError.BadState(msg: "this session has no BitBox02 pairing state")
@@ -85,15 +86,18 @@ public actor HwiSession {
     return try noise.export()
   }
 
-  /// Idempotent. Caller-owned transport remains open.
+  /// Idempotent; does not cancel a command or close the caller-owned transport.
+  /// Cancel the command task, unblock platform I/O if needed, and await its completion
+  /// before disconnecting and disposing the transport.
   public func disconnect() {
     makeInterp = nil
     noise = nil
   }
 
   private func run(_ command: HwiCommand) async throws -> HwiResponse {
-    await acquireCommand()
+    try await acquireCommand()
     defer { releaseCommand() }
+    try Task.checkCancellation()
     guard let makeInterp else { throw HwiError.BadState(msg: "session is disconnected") }
     let pairing = noise.flatMap { noise in
       onPairingCode.map { Hwi.Pairing(noise: noise, onCode: $0) }
@@ -107,19 +111,32 @@ public actor HwiSession {
     )
   }
 
-  private func acquireCommand() async {
+  private func acquireCommand() async throws {
+    try Task.checkCancellation()
     if !commandRunning {
       commandRunning = true
       return
     }
-    await withCheckedContinuation { commandWaiters.append($0) }
+    let id = UUID()
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        commandWaiters.append((id, continuation))
+      }
+    } onCancel: {
+      Task { await self.cancelWaiter(id) }
+    }
+  }
+
+  private func cancelWaiter(_ id: UUID) {
+    guard let index = commandWaiters.firstIndex(where: { $0.0 == id }) else { return }
+    commandWaiters.remove(at: index).1.resume(throwing: CancellationError())
   }
 
   private func releaseCommand() {
     if commandWaiters.isEmpty {
       commandRunning = false
     } else {
-      commandWaiters.removeFirst().resume()
+      commandWaiters.removeFirst().1.resume()
     }
   }
 
@@ -135,6 +152,7 @@ public actor HwiSession {
     HwiSession(makeInterp: { Interp.newLedger() }, link: LedgerBleLink(channel: ble))
   }
 
+  /// Synchronous native key generation; call off the main actor.
   public static func coldcardUSB(hid: any HidChannel) -> HwiSession {
     let encryption = ColdcardEncryption()
     return HwiSession(
@@ -143,6 +161,7 @@ public actor HwiSession {
     )
   }
 
+  /// Restores native pairing state synchronously; call off the main actor.
   public static func bitboxUSB(
     hid: any HidChannel,
     network: Network,

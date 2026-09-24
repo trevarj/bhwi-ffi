@@ -38,13 +38,10 @@ struct TransmitFixture: Decodable {
 }
 
 func fixture<T: Decodable>(_ name: String, as type: T.Type = T.self) throws -> T {
-  let root = URL(fileURLWithPath: #filePath)
-    .deletingLastPathComponent()
-    .deletingLastPathComponent()
-    .deletingLastPathComponent()
-    .deletingLastPathComponent()
-  return try JSONDecoder().decode(
-    type, from: Data(contentsOf: root.appendingPathComponent("fixtures/\(name)")))
+  guard let url = Bundle.module.url(forResource: name, withExtension: nil) else {
+    throw CocoaError(.fileNoSuchFile)
+  }
+  return try JSONDecoder().decode(type, from: Data(contentsOf: url))
 }
 
 actor ScriptedHid: HidChannel {
