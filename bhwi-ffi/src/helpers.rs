@@ -84,7 +84,7 @@ pub fn build_singlesig_descriptor(
     // miniscript appends is the authoritative one.
     Descriptor::<DescriptorPublicKey>::from_str(&descriptor)
         .map(|d| d.to_string())
-        .map_err(|e| HwiError::invalid(e.to_string()))
+        .map_err(|_| HwiError::invalid("invalid descriptor"))
 }
 
 /// Derives receive (`change == false`) or change addresses from a descriptor.
@@ -109,7 +109,7 @@ pub fn derive_addresses(
         .ok_or_else(|| HwiError::invalid("derivation index range overflows"))?;
 
     let parsed = Descriptor::<DescriptorPublicKey>::from_str(descriptor.trim())
-        .map_err(|e| HwiError::invalid(e.to_string()))?;
+        .map_err(|_| HwiError::invalid("invalid descriptor"))?;
     let branches = parsed
         .into_single_descriptors()
         .map_err(|e| HwiError::invalid(e.to_string()))?;
@@ -244,6 +244,42 @@ mod tests {
             derive_addresses(descriptor, Network::Testnet, false, 0, MAX_DERIVE_COUNT + 1),
             Err(HwiError::InvalidInput { .. })
         ));
+    }
+
+    #[test]
+    fn descriptor_parse_errors_do_not_leak_input() {
+        let canary = "ffi-redaction-canary";
+        let invalid_origin = "4242424242";
+        for (error, input) in [
+            (
+                derive_addresses(
+                    format!("wpkh({XPUB}/{canary}/*)"),
+                    Network::Testnet,
+                    false,
+                    0,
+                    1,
+                )
+                .expect_err("invalid descriptor path"),
+                canary,
+            ),
+            (
+                build_singlesig_descriptor(
+                    XPUB.into(),
+                    "f5acc2fd".into(),
+                    format!("m/{invalid_origin}"),
+                    AddressFormat::NativeSegwit,
+                    Network::Testnet,
+                )
+                .expect_err("invalid descriptor origin"),
+                invalid_origin,
+            ),
+        ] {
+            let HwiError::InvalidInput { ref msg } = error else {
+                panic!("expected invalid input, got {error:?}");
+            };
+            assert!(!msg.contains(input), "leaked error field: {error:?}");
+            assert!(!error.to_string().contains(input));
+        }
     }
 
     /// One P2WPKH input worth 10_000 sat, one 9_000 sat output: 1_000 sat fee.

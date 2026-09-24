@@ -15,16 +15,16 @@ rm -rf "$jni_libs" "$kotlin_out/uniffi"
 mkdir -p "$jni_libs" "$kotlin_out"
 
 echo "==> android cdylibs (arm64-v8a, x86_64)"
-cargo ndk -t arm64-v8a -t x86_64 -o "$jni_libs" build --release -p bhwi-ffi
+cargo ndk -t arm64-v8a -t x86_64 -o "$jni_libs" build --locked --release -p bhwi-ffi
 
 echo "==> host cdylib (JVM unit tests)"
-cargo build --release -p bhwi-ffi
+cargo build --locked --release -p bhwi-ffi
 
 echo "==> kotlin bindings"
 # Library mode reads the metadata out of the freshly built host cdylib, so the
 # bindings can never drift from the scaffolding. `--no-format` because ktlint is
 # not in the devshell.
-cargo run --release -q -p bhwi-ffi-bindgen -- generate \
+cargo run --locked --release -q -p bhwi-ffi-bindgen --bin bhwi-ffi-bindgen -- generate \
   --library target/release/libbhwi_ffi.so \
   --language kotlin \
   --out-dir "$kotlin_out" \

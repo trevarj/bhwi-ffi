@@ -3,11 +3,17 @@ package com.wizardsardine.bhwi
 import kotlin.test.assertFailsWith
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertTrue
 import org.junit.Test
+import uniffi.bhwi_ffi.ColdcardEncryption
 import uniffi.bhwi_ffi.HwiCommand
 import uniffi.bhwi_ffi.HwiException
 import uniffi.bhwi_ffi.HwiResponse
+import uniffi.bhwi_ffi.InternalException
 import uniffi.bhwi_ffi.Interp
+import uniffi.bhwi_ffi.Network
 import uniffi.bhwi_ffi.Recipient
 import uniffi.bhwi_ffi.Transmit
 
@@ -19,10 +25,17 @@ class TransmitReplayTest {
     @Test
     fun `the loop drives the fingerprint transcript`() = runBlocking<Unit> {
         val fixture = TransmitFixture.load("transmit_ledger_fingerprint.json")
-        val link = ScriptedLink(fixture)
+        val caller = Thread.currentThread()
+        val script = ScriptedLink(fixture)
+        val link = object : Link {
+            override suspend fun exchange(payload: ByteArray, encrypted: Boolean): ByteArray {
+                assertNotSame("the loop must leave the calling thread", caller, Thread.currentThread())
+                return script.exchange(payload, encrypted)
+            }
+        }
         val response = Hwi.runCommand(Interp.newLedger(), HwiCommand.GetMasterFingerprint, link)
-        assertEquals(fixture.expected, (response as HwiResponse.Fingerprint).hex)
-        link.check()
+        assertEquals(HwiResponse.Fingerprint("f5acc2fd"), response)
+        script.check()
     }
 
     @Test
@@ -52,6 +65,50 @@ class TransmitReplayTest {
         link.check()
     }
 
+    @Test
+    fun `a Coldcard parser error never exposes its reply`() = runBlocking<Unit> {
+        val canary = "ffi-redaction-canary"
+        val link = object : Link {
+            override suspend fun exchange(payload: ByteArray, encrypted: Boolean): ByteArray =
+                ("zzzz" + canary).encodeToByteArray()
+        }
+        ColdcardEncryption().use { encryption ->
+            val error = assertFailsWith<HwiException.Device> {
+                Hwi.runCommand(
+                    Interp.newColdcard(encryption),
+                    HwiCommand.Unlock(Network.TESTNET),
+                    link,
+                )
+            }
+            assertFalse(error.msg.contains(canary))
+            assertFalse(error.toString().contains(canary))
+            assertTrue(error.msg.contains("Coldcard"))
+        }
+    }
+
+    @Test
+    fun `a malformed Ledger signature does not break later FFI calls`() = runBlocking<Unit> {
+        val link = object : Link {
+            override suspend fun exchange(payload: ByteArray, encrypted: Boolean): ByteArray =
+                byteArrayOf(0x90.toByte(), 0)
+        }
+        val error = assertFailsWith<Exception> {
+            Hwi.runCommand(
+                Interp.newLedger(),
+                HwiCommand.SignMessage("test".encodeToByteArray(), "m/84'/1'/0'/0/0"),
+                link,
+            )
+        }
+        // The pinned parser panics on an empty signature. A future safe rejection is fine.
+        assertTrue(error is InternalException || error is HwiException.Device)
+
+        val fixture = TransmitFixture.load("transmit_ledger_fingerprint.json")
+        val replay = ScriptedLink(fixture)
+        val response = Hwi.runCommand(Interp.newLedger(), HwiCommand.GetMasterFingerprint, replay)
+        assertEquals(HwiResponse.Fingerprint(fixture.expected), response)
+        replay.check()
+    }
+
     /**
      * Jade's PIN-server payloads are the one thing that must not go to the device link.
      * Tested on the routing step itself: no real device produces such a transmit without a
@@ -74,8 +131,7 @@ class TransmitReplayTest {
     @Test
     fun `a PinServer transmit without an HttpBridge is a BadState`() = runBlocking<Unit> {
         val transmit = Transmit("0102".unhex(), false, Recipient.PinServer("http://pin.example/start"))
-        val error = assertFailsWith<HwiException.BadState> { Hwi.deliver(transmit, DeadLink(), null) }
-        assertEquals(true, error.msg.contains("HttpBridge"))
+        assertFailsWith<HwiException.BadState> { Hwi.deliver(transmit, DeadLink(), null) }
     }
 
     @Test

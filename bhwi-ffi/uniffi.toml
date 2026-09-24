@@ -1,0 +1,4 @@
+[bindings.swift]
+module_name = "Bhwi"
+ffi_module_name = "BhwiFFI"
+ffi_module_filename = "BhwiFFI"

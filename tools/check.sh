@@ -10,21 +10,34 @@ echo "==> cargo fmt"
 cargo fmt --all -- --check
 
 echo "==> cargo clippy"
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
 
 echo "==> cargo test"
-cargo test --workspace
+cargo test --locked --workspace
 
 echo "==> build-android"
-./tools/build-android.sh
+bash ./tools/build-android.sh
+
+echo "==> swift bindings (host metadata)"
+swift_check=target/swift-check
+rm -rf "$swift_check"
+cargo run --locked --release -q -p bhwi-ffi-bindgen --bin bhwi-ffi-bindgen-swift -- \
+  target/release/libbhwi_ffi.so "$swift_check" \
+  --swift-sources --headers --modulemap \
+  --module-name BhwiFFI --modulemap-filename module.modulemap
+for want in Bhwi.swift BhwiFFI.h module.modulemap; do
+  test -s "$swift_check/$want" || { echo "missing Swift binding output: $want" >&2; exit 1; }
+done
+grep -q '^module BhwiFFI {' "$swift_check/module.modulemap"
+grep -q '^import BhwiFFI$' "$swift_check/Bhwi.swift"
 
 echo "==> gradle"
-(cd android && ./gradlew --no-daemon :lib:assembleRelease publishToMavenLocal)
+(cd android && bash ./gradlew --no-daemon :lib:assembleRelease publishToMavenLocal)
 
 echo "==> jvm replay tests"
 # Replays the checked-in Ledger transcripts through the real FFI boundary against the
 # host cdylib built above.
-(cd android && ./gradlew --no-daemon :lib:testDebugUnitTest)
+(cd android && bash ./gradlew --no-daemon :lib:testDebugUnitTest)
 
 echo "==> aar contents"
 aar=android/lib/build/outputs/aar/lib-release.aar
@@ -70,6 +83,6 @@ ls -l "$m2"
 
 echo "==> sample app (consumes the mavenLocal AAR)"
 # Must come after the publication: `:sample` depends on the artifact, not the project.
-(cd android && ./gradlew --no-daemon :sample:assembleDebug :sample:assembleDebugAndroidTest)
+(cd android && bash ./gradlew --no-daemon :sample:assembleDebug :sample:assembleDebugAndroidTest)
 
 echo "==> all checks passed"

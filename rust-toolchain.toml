@@ -2,6 +2,11 @@
 # Match bhwi's pinned toolchain so interpreter behavior is identical.
 channel = "1.94.0"
 components = ["cargo", "rustc", "rustfmt", "clippy"]
-# Android targets for the AAR; host target is implicit (JVM replay tests).
-targets = ["aarch64-linux-android", "x86_64-linux-android"]
+# Android AAR and iOS XCFramework targets; host target is implicit for tests/bindgen.
+targets = [
+  "aarch64-linux-android",
+  "x86_64-linux-android",
+  "aarch64-apple-ios",
+  "aarch64-apple-ios-sim",
+]
 profile = "default"

@@ -75,6 +75,6 @@ echo "==> connectedDebugAndroidTest"
 # including any phone the developer happens to have plugged in.
 export ANDROID_SERIAL=emulator-5554
 # Default shell: it owns the build SDK, the NDK and the Gradle configuration.
-(cd android && ./gradlew --no-daemon :sample:connectedDebugAndroidTest)
+(cd android && bash ./gradlew --no-daemon :sample:connectedDebugAndroidTest)
 
 echo "==> instrumentation passed"

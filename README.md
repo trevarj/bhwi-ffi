@@ -1,95 +1,191 @@
 # bhwi-ffi
 
-Experimental Android bindings for [BHWI](https://github.com/wizardsardine/bhwi)
-(`wizardsardine/bhwi` issue #1). The crate exposes `bhwi`'s sans-io interpreter to
-Kotlin through [UniFFI](https://mozilla.github.io/uniffi-rs/), and the Gradle
-project here packages it as an AAR (`com.wizardsardine:bhwi-ffi-android`).
+bhwi-ffi provides experimental UniFFI bindings to BHWI's sans-I/O Bitcoin hardware-wallet interpreters.
 
-Supported devices are the ones `bhwi` supports: Ledger, Coldcard, BitBox02 and
-Jade, over whatever link the host implements.
+[BHWI](https://github.com/wizardsardine/bhwi) supplies the protocol state machines;
+this crate exposes their typed commands, transmits, responses and errors through
+[UniFFI](https://mozilla.github.io/uniffi-rs/). Rust handles protocol state. The host
+owns I/O, wire framing, HTTP and the driving loop, with no embedded Rust async
+runtime.
 
-Status: experimental. The API is not stable and the artifact is published as a
-snapshot only.
+This repository builds Kotlin bindings and an Android AAR, and contains a local
+Swift package for iOS. The API is experimental and not stable. Android publication
+installs a snapshot in **Maven Local**; Swift artifacts are built locally, not
+published as a remote package.
 
-The AAR ships two layers, and you can use either:
+## Workspace
 
-- **`uniffi.bhwi_ffi`** — the raw interpreter surface generated from the crate.
-  Full control: you own the `Interp`, the state handles and the loop.
-- **`com.wizardsardine.bhwi`** — a Kotlin host layer over it: the per-device wire
-  framing, the driving loop, and an `HwiSession` facade with one suspend method per
-  command. Most apps only need this.
+The Cargo workspace has two members:
 
-## Architecture
+| Crate | Responsibility |
+|---|---|
+| `bhwi-ffi/` | Native FFI library: interpreters, state handles, typed data and pure helpers. |
+| `bindgen/` | `bhwi-ffi-bindgen`, using the same UniFFI version as the library. |
 
-The crate contains no I/O at all. The host owns the transport, the per-device wire
-framing, the Jade PIN-server HTTP request and the driving loop; the crate owns the
-protocol state machines, which come from `bhwi`.
+Outside the Cargo workspace, `android/` packages the generated bindings and Kotlin
+host layer and supplies a consumer sample; `tools/` contains build and verification
+scripts. `bhwi-async` is only a test dependency, used to produce reference transport
+fixtures; its I/O and runtime integration do not ship in the native library.
 
-- **One device-generic API.** `Interp` runs one `bhwi::common::Command` against one
-  device. Only the constructor is per-device (`new_ledger`, `new_jade`,
-  `new_bitbox`, `new_coldcard`). What crosses the boundary is a `Transmit`
-  (`payload`, `encrypted`, `recipient`) out and reply bytes in.
-- **Everything is synchronous.** No async, no worker threads, no foreign callbacks.
-  A command is a loop in Kotlin:
+## Runtime support
 
-  ```kotlin
-  var transmit = interp.start(command)
-  while (true) {
-      val reply = send(transmit)             // host I/O: USB, BLE, or an HTTP POST
-      transmit = interp.exchange(reply) ?: break
-  }
-  val response = interp.end()
-  ```
-- **`Recipient` tells the host where a payload goes.** `Device` for the wire,
-  `PinServer { url }` for Jade's PIN server (POST the payload as
-  `application/json`, feed the response body back to `exchange`).
-- **State that outlives a command lives in a handle.** `NoiseHandle` holds BitBox02
-  pairing material (`export()` it after an unlock and restore it next time to skip
-  the on-screen confirmation; `takePairingCode()` polls the code mid-unlock).
-  `ColdcardEncryption` holds the link-encryption engine for one connection. An
-  interpreter leases its handle for its lifetime; a second interpreter on a leased
-  handle fails with `HwiException.BadState`.
-- **Typed errors.** Device refusals are `UserRefused`, pairing/handshake rejection
-  is `AuthRefused`, bad caller input is `InvalidInput`, and misuse of the object
-  lifecycle is `BadState`. There is no transport error variant: transport failures
-  are the host's own, in its own error type.
+| Host | Status | Evidence and limits |
+|---|---|---|
+| Kotlin / Android (arm64-v8a, x86_64) | Experimental baseline | JVM fixture replay and Android build/instrumentation tooling; hardware behavior is not guaranteed. Run the separate instrumentation script to execute emulator tests. |
+| Swift / iOS 16+ (arm64 device, arm64 simulator) | **UNTESTED** on physical devices | Apple build, simulator XCTest, runtime and device signing are **unverified**. Local XCFramework and caller-owned adapters are required. |
+| Swift / macOS | Unsupported | No macOS slice in the XCFramework; the package does not support macOS. |
 
-## The Kotlin host layer (`com.wizardsardine.bhwi`)
+## Supported devices and capabilities
 
-Everything below is hand-written Kotlin in the AAR, not generated. It is the host
-half the crate deliberately does not contain.
+The binding exposes **BitBox02, Coldcard, Jade and Ledger**. This is not a hardware
+validation matrix or a promise that every device supports every command.
 
-### Transport interfaces
+The current command subset is `Unlock`, `GetVersion`, `GetMasterFingerprint`,
+`GetXpub`, singlesig `DisplayAddress` by derivation path, `SignMessage` and
+`SignPsbt`. Ledger PSBT signing is unsupported because this binding does not supply
+its wallet-policy context. Setup, wipe, restore, backup, wallet registration and
+multisig address display are not exposed.
 
-An app implements one of these per link. They are plain suspend interfaces; failures
-are reported as `TransportException.Io` / `.Disconnected` / `.Cancelled`, which is a
-plain Kotlin hierarchy (the FFI has no transport error variant — transport failures
-are the host's own).
+Device-free helpers build singlesig descriptors (`build_singlesig_descriptor`),
+derive receive/change addresses (`derive_addresses`) and inspect PSBTs
+(`psbt_summary`). Generated Kotlin names are `buildSinglesigDescriptor`,
+`deriveAddresses` and `psbtSummary`.
+
+## Using the bindings
+
+### Interpreter lifecycle
+
+An `Interp` runs one command against one device. Only construction is device-specific:
+`new_ledger`, `new_coldcard`, `new_bitbox` or `new_jade`. The shared lifecycle is
+`start -> exchange* -> end`:
+
+1. `start(HwiCommand)` returns a `Transmit` containing `payload`, `encrypted` and
+   `recipient`.
+2. The host delivers that payload and feeds the reply bytes to `exchange`. Repeat
+   until it returns no further transmit.
+3. `end()` consumes the command state and returns a typed `HwiResponse`.
+
+The Rust boundary is synchronous and performs no I/O. Native objects are
+`Send + Sync` and internally locked, but calls in a command's lifecycle must not
+interleave. Use one interpreter per command and close its generated wrapper on
+all paths, even after `end()`. In Kotlin, use `use { }` or `close()` rather than
+relying on garbage collection.
+
+State that survives a command lives in a separate handle: `NoiseHandle` stores
+BitBox02 pairing material, and `ColdcardEncryption` stores link-encryption state
+for one connection. An interpreter exclusively leases its handle while its command
+state is alive; a second interpreter on the same handle fails with `BadState`.
+Ending or dropping the interpreter releases the lease. Rejected local input is
+validated before native session mutation; a protocol failure retires the command
+state, so later calls on that interpreter fail with `BadState`.
+
+Rust's structured `HwiError` distinguishes `Device`, `UserRefused`, `AuthRefused`,
+`InvalidInput`, `BadState` and `Internal`. Device refusals and authentication
+rejections remain distinct from invalid caller input and lifecycle misuse. These
+become Kotlin `HwiException` variants. Transport and HTTP failures belong to the
+host and have no FFI error variant.
+
+Messages in these structured `HwiError` values do not carry raw protocol payloads
+or key material. This guarantee does **not** cover unexpected failures: UniFFI
+catches unwinding panics and reports them separately as Kotlin `InternalException`,
+which can preserve panic text. Aborts and out-of-memory failures are not made
+recoverable by that boundary.
+
+The Kotlin threading and ownership contract is:
+
+- Generated UniFFI constructors, methods and helpers are synchronous and
+  **worker-only**. Protocol parsing and cryptography are not UI-thread work just
+  because they perform no I/O. All synchronous `HwiSession` factories are also
+  worker-only: `coldcardUsb` generates native key material, `bitboxUsb` restores
+  native state, and the other factories currently defer native initialization.
+- `Hwi.runCommand`, the seven `HwiSession` suspend commands and `bitboxPairing()` are
+  **main-safe**. They run command work in `Dispatchers.IO`; session construction
+  still belongs on a worker. Keep construction, use and cleanup in one ownership
+  block rather than returning a newly owned native object across a cancellable
+  dispatcher boundary.
+- Facade-driven transport, HTTP and pairing callbacks run in the command's IO
+  context, without fixed worker-thread identity. Adapters must cooperate with
+  cancellation and marshal platform/UI callbacks themselves. Direct `Link` use
+  retains caller-context execution. Pairing callbacks are synchronous, before the
+  next protocol payload; the loop launches no hidden callback coroutines.
+- Cancellation is checked at command/transport boundaries. A synchronous native
+  call already executing completes before the next checkpoint; cancellation cannot
+  preempt it or unblock arbitrary platform I/O. Normal coroutine cancellation stays
+  `CancellationException`; `TransportException.Cancelled` is a separate adapter
+  domain error.
+- `disconnect()` is synchronous, idempotent and outside the command mutex. It closes
+  the facade and releases its handle references; later commands fail with
+  `HwiException.BadState`. It neither owns/cancels an operation Job nor unblocks the
+  caller's transport, and it does not guarantee that an in-flight command cannot
+  finish. For teardown: **cancel the operation, unblock caller-owned platform I/O
+  if needed, join the operation, disconnect, then dispose the transport**.
+
+### Kotlin host layer
+
+The AAR provides both `uniffi.bhwi_ffi` (generated objects and helpers) and
+`com.wizardsardine.bhwi` (handwritten framing, loop and session facade).
+
+`Hwi.runCommand` drives the lifecycle and takes ownership of its `Interp`, closing
+it on every path, including cancellation before IO dispatch. Only plain response
+data leaves this ownership block:
+
+```kotlin
+val response = withContext(Dispatchers.IO) {
+    Hwi.runCommand(
+        interp = Interp.newLedger(),
+        cmd = HwiCommand.GetMasterFingerprint,
+        link = link,
+    )
+}
+```
+
+`HwiSession` represents one connected device. Its mutex serializes commands, each
+using a fresh interpreter. Suspend commands themselves can be called from Main;
+this example keeps synchronous construction and cleanup on IO too:
+
+```kotlin
+val (fingerprint, xpub) = withContext(Dispatchers.IO) {
+    val session = HwiSession.ledgerUsb(myHidChannel)
+    try {
+        session.unlock(Network.TESTNET)
+        val fingerprint = session.getMasterFingerprint()
+        val xpub = session.getExtendedPubkey("m/84'/1'/0'", display = false)
+        fingerprint to xpub
+    } finally {
+        session.disconnect()
+    }
+}
+```
+
+Factories are `ledgerUsb(hid)`, `ledgerBle(ble)`, `coldcardUsb(hid)`,
+`bitboxUsb(hid, network, onPairingCode, noiseConfig)`, `jadeUsb(serial, http, network)`
+and `jadeBle(serial, http, network)`. Commands are `unlock`, `getInfo`,
+`getMasterFingerprint`, `getExtendedPubkey`, `displayAddress`, `signMessage` and
+`signPsbt`. The caller owns the transport; session cleanup does not dispose it.
+
+### Transports and framing
+
+Implement the interface for the platform link. Transport failures use the host-side
+`TransportException.Io`, `.Disconnected` or `.Cancelled` hierarchy, not
+`HwiException`. Adapter error messages must not expose payload bytes.
 
 | Interface | Methods | Used by |
 |---|---|---|
-| `HidChannel` | `send(report): UInt`, `receive(maxLen): ByteArray` | Ledger, Coldcard, BitBox02 over USB |
-| `SerialStream` | `writeAll(data)`, `read(maxLen): ByteArray` | Jade, over USB serial or BLE |
-| `BleChannel` | `write(data)`, `read(): ByteArray`, `mtu(): UShort` | Ledger over BLE |
-| `HttpBridge` | `request(url, body): ByteArray` | Jade's PIN server only |
+| `HidChannel` | `send(report): UInt`, `receive(maxLen): ByteArray` | Ledger, Coldcard and BitBox02 USB |
+| `SerialStream` | `writeAll(data)`, `read(maxLen): ByteArray` | Jade USB serial or BLE |
+| `BleChannel` | `write(data)`, `read(): ByteArray`, `mtu(): UShort` | Ledger BLE |
+| `HttpBridge` | `request(url, body): ByteArray` | Jade PIN server |
 
-Two contracts that are easy to get wrong:
+- An empty `SerialStream.read` result means **end of stream**, not "no data yet".
+  It aborts an incomplete CBOR message. Suspend until data is available, or throw
+  `TransportException.Disconnected` when the link drops.
+- `HidChannel.receive` and `SerialStream.read` may return fewer bytes than requested,
+  never more.
+- `HidChannel.send` receives a reused scratch buffer: consume it before returning
+  and do not retain its reference. The next report overwrites it; report-level
+  fixtures include the reference transport's unused tail bytes on short reports.
 
-- **`SerialStream.read` returning an empty array means end of stream**, i.e. the
-  device is gone; it aborts the command with "stream ended before complete CBOR
-  message". "No data yet" must **not** return empty — suspend until at least one byte
-  is available, or throw `TransportException.Disconnected`.
-- **`HidChannel.send` gets a reused scratch buffer.** Consume it before returning and
-  do not keep a reference; the framing layer overwrites it for the next report.
-  (This mirrors the reference transports, down to the stale tail bytes a final short
-  chunk leaves behind — which is exactly what the report-level fixtures record.)
-
-`receive`/`read` may return fewer bytes than asked for, never more.
-
-### Links
-
-A `Link` is one logical request/response exchange with a device, whatever the wire
-framing underneath:
+A `Link` moves one logical request/response, independent of framing:
 
 ```kotlin
 interface Link {
@@ -97,277 +193,343 @@ interface Link {
 }
 ```
 
-The framings are ports of the `bhwi-async` transports (cross-checked against the
-maintainer's Zig host example):
+The host layer supplies these framings:
 
 | Link | Framing |
 |---|---|
-| `LedgerHidLink(HidChannel)` | channel `0x0101`, tag `0x05`, u16 BE sequence, u16 BE total length, 64-byte reports |
-| `LedgerBleLink(BleChannel)` | tag `0x05`, u16 BE sequence, u16 BE length on frame 0; MTU inferred once with `[0x08,0,0,0,0]` |
-| `ColdcardHidLink(HidChannel)` | length byte with `0x80` on the last chunk and `0x40` when `encrypted` |
-| `BitBoxHidLink(HidChannel)` | U2F-HID frames carrying the HWW request/response layer, with the NOTREADY retry |
-| `JadeSerialLink(SerialStream)` | write, then read until one complete CBOR value has arrived |
+| `LedgerHidLink(HidChannel)` | Channel `0x0101`, tag `0x05`, u16 BE sequence, u16 BE total length on the first frame; 64-byte reports. |
+| `LedgerBleLink(BleChannel)` | Tag `0x05`, u16 BE sequence, u16 BE length on frame 0; MTU inferred once with `[0x08,0,0,0,0]`. |
+| `ColdcardHidLink(HidChannel)` | Length byte with `0x80` on the last chunk and `0x40` when `encrypted`. |
+| `BitBoxHidLink(HidChannel)` | U2F-HID frames carrying the HWW request/response layer, including NOTREADY retry. |
+| `JadeSerialLink(SerialStream)` | Write, then read until one complete CBOR value has arrived. |
 
-`encrypted` is only on the wire for Coldcard. BitBox ignores it (its noise encryption
-is inside the payload the interpreter already produced), and so do both reference
-transports.
+Only Coldcard framing signals `encrypted` on the wire. BitBox02 ignores the flag
+because its Noise encryption is already inside the interpreter's payload, as in
+the reference transports.
 
-### The loop
+`Recipient.Device` goes through the `Link`. `Recipient.PinServer { url }` is Jade
+HTTP traffic: POST the payload to that URL as `application/json` and return the
+response body to `exchange`. `Hwi.runCommand` routes it through `HttpBridge` and
+fails with `HwiException.BadState` if no bridge was supplied; it must not go to the
+device link.
+
+Adding a transport for an **already exposed device/protocol** requires no Rust
+change: implement an existing channel interface and reuse its framing, or implement
+`Link` directly and honor `encrypted` where the protocol requires it. This does not
+add support for a new device protocol.
+
+### BitBox02 pairing
+
+After a successful unlock, export pairing material and restore it on the next
+connection to reuse the confirmed pairing. `HwiSession` polls for a pairing code
+after each exchange, before the next payload. When driving the loop directly, pass
+`pairing = Hwi.Pairing(noiseHandle, onCode)` to `Hwi.runCommand`; it uses
+`NoiseHandle.takePairingCode()` to retrieve the code.
+
+For an Android UI, post the code to the view rather than touching UI state from the
+IO callback:
 
 ```kotlin
-val response = Hwi.runCommand(Interp.newLedger(), HwiCommand.GetMasterFingerprint, link)
-```
-
-`runCommand` does `start` -> send/receive -> `exchange` -> `end`, routes
-`Recipient.PinServer` transmits through the `http` bridge (and fails with `BadState`
-if there is none), and destroys the `Interp` on every path so its state lease is
-released. Pass `pairing = Hwi.Pairing(noiseHandle, ::showCode)` for BitBox02 and the
-pairing code is surfaced after every exchange, before the next payload goes out.
-
-### `HwiSession`
-
-One connected device, one command at a time. A `kotlinx` mutex serialises commands;
-each one builds a fresh `Interp` and delegates to `Hwi.runCommand`.
-
-```kotlin
-val session = HwiSession.ledgerUsb(myHidChannel)
-try {
-    session.unlock(Network.TESTNET)
-    val fingerprint = session.getMasterFingerprint()
-    val xpub = session.getExtendedPubkey("m/84'/1'/0'", display = false)
-} finally {
-    session.disconnect()
+withContext(Dispatchers.IO) {
+    val session = HwiSession.bitboxUsb(
+        hid = myHidChannel,
+        network = Network.TESTNET,
+        onPairingCode = { code -> view.post { showOnScreen(code) } },
+        noiseConfig = store.load(), // null on the first connection
+    )
+    try {
+        session.unlock(Network.TESTNET)
+        store.save(session.bitboxPairing())
+    } finally {
+        session.disconnect()
+    }
 }
 ```
 
-Factories: `ledgerUsb(hid)`, `ledgerBle(ble)`, `coldcardUsb(hid)`,
-`bitboxUsb(hid, network, onPairingCode, noiseConfig)`, `jadeUsb(serial, http, network)`,
-`jadeBle(serial, http, network)`.
+`NoiseConfig` is plain data (`privkey: ByteArray?`, `devicePubkeys: List<ByteArray>`),
+but it is **key material**: protect its storage as you would a private key. Raw
+hosts can export it with `NoiseHandle.export()` once the interpreter's lease is
+released and restore it when constructing the next handle.
 
-Commands: `unlock`, `getInfo`, `getMasterFingerprint`, `getExtendedPubkey`,
-`displayAddress`, `signMessage`, `signPsbt`. `disconnect()` is idempotent and releases
-the device state handles; calls after it fail with `HwiException.BadState`. The
-transport itself belongs to the caller and is left alone.
+## Android
 
-### BitBox02 pairing persistence
+### Prerequisites
 
-Export the pairing material after a successful unlock and restore it next time, and
-the device stops asking the user to confirm the code:
-
-```kotlin
-val session = HwiSession.bitboxUsb(
-    hid = myHidChannel,
-    network = Network.TESTNET,
-    onPairingCode = { code -> showOnScreen(code) },   // first pairing only
-    noiseConfig = store.load(),                       // null on the very first run
-)
-session.unlock(Network.TESTNET)
-store.save(session.bitboxPairing())                   // NoiseConfig: privkey + device pubkeys
-```
-
-`NoiseConfig` is plain data (`privkey: ByteArray?`, `devicePubkeys: List<ByteArray>`).
-It is key material: persist it the way you would a private key.
-
-## Threading contract
-
-- **All calls are blocking and cheap.** They do protocol work only (parsing,
-  encryption, PSBT handling) and never wait on a device, so calling from any
-  dispatcher is fine.
-- **Objects are `Send + Sync`** and internally locked; an `Interp` still runs one
-  command, and the sequence `start` / `exchange`* / `end` must not interleave with
-  itself.
-- **One `Interp` per command, one state handle per connection.** Both are consumed
-  or released explicitly (`end()`, or the UniFFI `close()`/`use { }` destructor).
-
-## Prerequisites
-
-`nix develop` provides everything:
+The current `.so`-based build and JVM tooling is a **Linux-host workflow**.
+Platform-neutral bindings do not imply portable build scripts. `nix develop`
+provides the pinned toolchain:
 
 | Tool | Version |
 |---|---|
-| Rust | 1.94.0 + `aarch64-linux-android`, `x86_64-linux-android` |
-| cargo-ndk | from nixpkgs |
+| Rust | 1.94.0 with `aarch64-linux-android` and `x86_64-linux-android` |
+| cargo-ndk | From pinned nixpkgs |
 | Android NDK | 28.2.13676358 (r28) |
 | JDK | 21 |
-| Android SDK | platform 35, build-tools 35.0.0 |
+| Android SDK | Platform 35, build-tools 35.0.0 |
 
-Without Nix, install the same set by hand and export `ANDROID_HOME` /
-`ANDROID_NDK_HOME`.
-
-On NixOS the aapt2 that AGP downloads from Maven is dynamically linked and will not
-run; the devshell's `GRADLE_OPTS` points AGP at the SDK's own aapt2. Keep using
+Without Nix, install the same tools and export `ANDROID_HOME` and
+`ANDROID_NDK_HOME`. On NixOS, AGP's Maven-downloaded aapt2 is dynamically linked and
+will not run; the dev shell's `GRADLE_OPTS` selects the SDK's aapt2 instead. Use
 `nix develop` rather than a bare shell.
 
-Gradle itself is not in the devshell — the committed wrapper downloads it.
+Gradle is downloaded by the committed, checksum-pinned wrapper, not supplied by
+the dev shell:
 
 | Component | Version |
 |---|---|
-| Gradle | 8.14.3 (wrapper, checksum-pinned) |
+| Gradle | 8.14.3 |
 | Android Gradle Plugin | 8.13.2 |
 | Kotlin | 2.2.21 |
+| UniFFI | 0.32.0 |
 | JNA | 5.19.0 (`@aar`) |
 | kotlinx-coroutines-core | 1.10.2 |
 
-AGP 8.13 is the newest release at time of writing; it requires Gradle 8.13+ and
-JDK 17+, and `buildToolsVersion` is pinned to 35.0.0 because the Nix-provided SDK
-is read-only and AGP must not try to fetch a different revision.
+`buildToolsVersion` is pinned to 35.0.0 because the Nix SDK is read-only; AGP must
+not try to fetch a different revision.
 
-## Build
+### Build and install
+
+From the repository root:
 
 ```sh
-nix develop -c ./tools/build-android.sh
-nix develop -c bash -c 'cd android && ./gradlew :lib:publishToMavenLocal'
+nix develop -c bash ./tools/build-android.sh
+nix develop -c bash -c 'cd android && bash ./gradlew :lib:publishToMavenLocal'
 ```
 
-`tools/build-android.sh` produces everything Gradle consumes:
+The native builder uses locked Cargo resolution and produces:
 
-1. `cargo ndk` builds `libbhwi_ffi.so` for `arm64-v8a` and `x86_64` into
+1. `libbhwi_ffi.so` for `arm64-v8a` and `x86_64` under
    `android/lib/src/main/jniLibs/`.
-2. A host `libbhwi_ffi.so` in `target/release/` for JVM unit tests.
-3. `bhwi-ffi-bindgen` generates `android/lib/src/main/kotlin/uniffi/bhwi_ffi/bhwi_ffi.kt`
-   from that host library (UniFFI "library mode", so the bindings can never drift
-   from the scaffolding).
+2. `target/release/libbhwi_ffi.so` for host JVM replay.
+3. `android/lib/src/main/kotlin/uniffi/bhwi_ffi/bhwi_ffi.kt`, generated from that
+   host library's metadata using the version-matched bindgen (UniFFI library mode).
 
-It is idempotent and wipes both generated trees first. Both are `.gitignore`d:
-**Gradle does not invoke Cargo**, so any consumer (or CI job) must run the script
-before building the AAR. After that, the Gradle build needs only a JDK and the SDK.
+The script clears and regenerates the JNI and generated Kotlin trees; both are
+ignored by Git. **Gradle does not run Cargo**: run the builder before building the
+AAR, and rerun it after native changes. Once those inputs exist, Gradle needs only
+the JDK and Android SDK.
 
-`tools/check.sh` is the full gate: `cargo fmt --check`, `cargo clippy -D warnings`,
-`cargo test`, `build-android.sh`, `:lib:assembleRelease publishToMavenLocal`, the JVM
-replay suite, assertions on the AAR contents and the published files, and the sample
-app build.
-
-### Artifact layout
-
-`com.wizardsardine:bhwi-ffi-android:0.1.0-SNAPSHOT` (AAR):
-
-```
-jni/arm64-v8a/libbhwi_ffi.so
-jni/x86_64/libbhwi_ffi.so
-classes.jar            # uniffi/bhwi_ffi/*.class  (generated bindings)
-                       # com/wizardsardine/bhwi/*.class  (Kotlin host layer)
-proguard.txt           # consumer rules keeping JNA + the bindings
-```
-
-`x86_64` is there for the emulator; there is no `armeabi-v7a` or `x86` build.
-JNA (`net.java.dev.jna:jna:5.19.0@aar`, which ships `libjnidispatch.so`) and
-`kotlinx-coroutines-core` come in transitively from the POM. minSdk 28.
-
-To consume it:
+`publishToMavenLocal` installs `com.wizardsardine:bhwi-ffi-android:0.1.0-SNAPSHOT`
+under `~/.m2/repository/`, with its AAR, POM, Gradle module metadata and sources JAR.
+An Android consumer uses:
 
 ```kotlin
 repositories { mavenLocal(); google(); mavenCentral() }
 dependencies { implementation("com.wizardsardine:bhwi-ffi-android:0.1.0-SNAPSHOT") }
 ```
 
-## Adding a transport
+### AAR contents
 
-Entirely host-side: no Rust change. If the new link is one of the shapes above (an
-HID report channel, a byte stream, a GATT pair), implement that interface and reuse
-the existing `Link`. If it needs its own framing, implement `Link` directly: move
-`payload` over the wire, honour `encrypted` if the framing signals it, and return the
-reply. The fixtures below exist to verify exactly that layer.
+The release AAR is `android/lib/build/outputs/aar/lib-release.aar`:
 
-## Fixtures and JVM replay testing
+```text
+jni/arm64-v8a/libbhwi_ffi.so
+jni/x86_64/libbhwi_ffi.so
+classes.jar            # uniffi/bhwi_ffi/*.class (generated bindings)
+                       # com/wizardsardine/bhwi/*.class (Kotlin host layer)
+proguard.txt           # consumer rules keeping JNA and the bindings
+```
 
-`fixtures/` holds two levels of checked-in vectors, both produced and verified by
-`bhwi-ffi/tests/fixtures.rs`:
+The minimum Android API is 28. `x86_64` supports the emulator; there is no
+`armeabi-v7a` or `x86` build. JNA (`net.java.dev.jna:jna:5.19.0@aar`, including
+`libjnidispatch.so`) and `kotlinx-coroutines-core` are transitive dependencies of the
+published artifact.
 
-- `ledger_*.json`: report-level transcripts (`writes`/`reads` as hex HID reports)
-  generated by driving the real `bhwi-async` Ledger transport in-memory.
-  `bhwi-async` is a dev-dependency for exactly this reason — the host reimplements
-  that framing and needs a byte-for-byte reference.
-- `transmit_*.json`: the same commands at the FFI boundary (`payload_hex`,
-  `encrypted`, `reply_hex` per exchange), so a Kotlin driving loop can be replayed
-  against a scripted device.
+## Swift / iOS
 
-Set `BHWI_REGENERATE_FIXTURES=1` to rewrite them after an intentional protocol
-change; otherwise any drift fails the test.
+`Package.swift` exposes `Bhwi` for iOS 16+. It contains generated UniFFI types
+and a Swift host layer (`Hwi`, actor-isolated `HwiSession`, framing links and
+transport protocols). Building the local package requires full Xcode, an iOS SDK,
+Cargo and the Rust iOS arm64 device/simulator targets in `rust-toolchain.toml`.
+On an Apple Silicon Mac, from the repository root:
 
-A JVM unit test replays those vectors through the real bindings, with no device and
-no emulator, with JNA pointed at the host library the build script already
-produced.
+```sh
+bash tools/build-ios.sh
+# Add this directory as a local Swift package dependency in Xcode.
+bash tools/check-ios.sh
+```
 
-```kotlin
-// lib/build.gradle.kts
-tasks.withType<Test>().configureEach {
-    systemProperty("jna.library.path", rootDir.resolve("../target/release").canonicalPath)
-    systemProperty("bhwi.fixtures.dir", rootDir.resolve("../fixtures").canonicalPath)
+The builder uses locked Cargo resolution, generates
+`ios/Sources/Bhwi/Generated/Bhwi.swift` plus the C header/module map, and
+assembles `target/ios/BhwiFFI.xcframework` from arm64 iOS device and simulator
+static libraries. Generated code and native artifacts are ignored: rebuild
+after cloning or changing the native API. The package cannot resolve from a
+remote checkout without those artifacts. There is no Intel simulator or macOS
+slice. `check-ios.sh` selects an available iPhone simulator and runs XCTest;
+override selection with `BHWI_IOS_DESTINATION='platform=iOS Simulator,name=iPhone 16'`.
+Apple artifact builds and simulator execution remain unverified.
+
+Swift exposes `unlock`, `getInfo`, `getMasterFingerprint`, `getExtendedPubkey`,
+`displayAddress`, `signMessage`, `signPsbt` and BitBox02 pairing export, subject
+to the native command/device limitations above (notably no Ledger PSBT signing).
+For example, a **caller-owned testnet wallet** can supply an unsigned PSBT and
+a caller-owned Jade BLE serial adapter and trusted PIN-server HTTP bridge:
+
+```swift
+func signOnJade(
+  testnetPsbtBase64: String,
+  jadeBleStream: any SerialStream,
+  trustedPinBridge: any HttpBridge
+) async throws -> String {
+  let session = HwiSession.jade(
+    serial: jadeBleStream, http: trustedPinBridge, network: .testnet)
+  do {
+    try await session.unlock(network: .testnet)
+    let signed = try await session.signPsbt(testnetPsbtBase64)
+    await session.disconnect()
+    return signed
+  } catch {
+    await session.disconnect()
+    throw error
+  }
 }
 ```
 
-The generated bindings load the library by the base name `bhwi_ffi`, so
-`target/release/libbhwi_ffi.so` is found as-is.
+This illustrates the API, **not tested device signing**: the caller must
+configure the Jade for testnet, create/validate a wallet PSBT, implement BLE
+stream framing and a PIN bridge that restricts device-supplied URLs to trusted
+HTTPS hosts and prevents unsafe redirects. The returned PSBT still needs
+wallet-side verification and finalization. Device signing, platform adapter
+integration and acceptance on a signed iOS app remain outstanding.
 
-## Testing
+The caller supplies `HidChannel` (Ledger/Coldcard/BitBox02 USB), `BleChannel`
+(Ledger BLE), `SerialStream` (Jade serial/BLE), and `HttpBridge` (Jade PIN
+server). Generic USB HID is not available to ordinary iOS apps; USB factories
+need an allowed accessory mechanism. No platform transport ships here.
+Transport implementations must honor requested read sizes, fail on EOF, avoid
+leaking payloads in errors, cooperate with task cancellation and unblock their
+own I/O. `HwiSession` serializes commands and pairing export; `disconnect()`
+does not cancel an in-flight command or close transport. Cancel the operation,
+unblock I/O if necessary, await completion, disconnect, then dispose the
+caller-owned transport. Native constructors/helpers are synchronous and belong
+off the main actor. Keep BitBox02 pairing key material in secure storage.
+
+The Linux gate additionally checks Swift binding/header/module-map
+**generation** against host metadata; it neither builds the iOS XCFramework
+nor compiles Swift. Apple simulator replay, iOS runtime and physical-device
+signing still require the Apple gate and a signed app with real adapters.
+
+Host-source verification on Linux x86_64 with Swift 5.10.1 passed all 31 XCTest
+cases against the real generated bindings and Rust library, using a temporary
+host package and explicit XCTest registration. A separate Swift consumer replayed
+the Ledger fingerprint fixture and checked post-disconnect errors. The Jade
+near-limit coalesced-response regression failed before its fix and passed after.
+This does not validate the iOS binary target or establish a supported Linux package.
+
+## Development and verification
+
+Run the full non-emulator gate from the repository root:
 
 ```sh
-nix develop -c ./tools/build-android.sh                                  # once
-nix develop -c bash -c 'cd android && ./gradlew :lib:testDebugUnitTest'  # JVM replay suite
-nix develop -c bash tools/check.sh                                       # everything
+nix develop -c bash tools/check.sh
 ```
 
-The JVM suite is the hard gate: it runs the real FFI boundary against the host
-cdylib. It covers
+It checks Rust formatting, Clippy and tests; builds both Android ABIs, the host
+library and Kotlin bindings; assembles and publishes the AAR to Maven Local; runs
+the real JVM replay suite; checks AAR contents and publication files; and builds
+the sample and instrumentation APKs. Clippy, Rust tests, native builds and bindgen
+use `--locked` so dependency resolution cannot silently update the lockfile. The gate **builds
+instrumentation APKs but does not run them**.
 
-- **report-level replay** — the Kotlin Ledger HID framing plus the real interpreter
-  against transcripts recorded from `bhwi-async`'s own transport, so any framing
-  drift fails as a byte mismatch;
-- **transmit-level replay** — the driving loop against a scripted `Link`, asserting
-  each payload and its `encrypted` flag, with no framing in the way;
-- **framing units** — Ledger HID chunking across reports, Ledger BLE MTU inference /
-  fragmentation / reassembly, the Coldcard chunk flags, U2F round trips and the HWW
-  retry, and the CBOR completeness scanner;
-- **lifecycle** — idempotent disconnect, post-disconnect `BadState`, mutex
-  serialisation of concurrent calls, and the state-handle lease (a second `Interp` on
-  a leased `NoiseHandle` is a `BadState`);
-- **the pure helpers**, against the same vectors the Rust tests use.
+The gate also generates the Swift source/header/module map from host metadata;
+it does not compile Swift or validate the Apple binary target.
 
-`android/sample` is a minimal app that consumes the **published** AAR from
-`mavenLocal` (not `project(":lib")`), so it exercises the real consumption path. Its
-`androidTest` replays the fingerprint fixture on-device, reading the same
-`fixtures/*.json` (wired in as androidTest assets).
+### Fixtures and JVM replay
+
+`fixtures/` has two levels of checked-in vectors, produced and verified by
+[`bhwi-ffi/tests/fixtures.rs`](bhwi-ffi/tests/fixtures.rs):
+
+- `ledger_*.json`: report-level transcripts (`writes`/`reads` as hex HID reports)
+  generated by the real `bhwi-async` Ledger transport driven in memory. Kotlin
+  framing must match these byte for byte.
+- `transmit_*.json`: FFI-boundary exchanges (`payload_hex`, `encrypted`, `reply_hex`)
+  for replaying the command loop against a scripted `Link`, without wire framing.
+
+`BHWI_REGENERATE_FIXTURES=1` is an explicitly **mutating regeneration option**, not
+validation: it rewrites the vectors after an intentional protocol change. Without
+it, fixture drift fails the test.
+
+JVM tests replay these vectors through real generated bindings and the host
+`libbhwi_ffi.so`, without a device or emulator. Gradle already sets
+`jna.library.path` to `target/release` and `bhwi.fixtures.dir` to `fixtures`; the
+library loads by the base name `bhwi_ffi`. After running the native builder above,
+the JVM suite can also be run alone:
+
+```sh
+nix develop -c bash -c 'cd android && bash ./gradlew :lib:testDebugUnitTest'
+```
+
+Coverage includes report/transmit replay, typed success and refusal, framing
+(Ledger HID/BLE, Coldcard flags, U2F/HWW and CBOR completeness), command
+serialization, leases, disconnect and cancellation, structured-error redaction,
+malformed-response boundary survival and pure helpers. These are deterministic
+binding/transport checks, not validation against every physical device.
+
+### Android instrumentation
+
+`android/sample` consumes the **Maven Local AAR**, not `project(":lib")`. Its
+instrumentation test replays the fingerprint fixture from `androidTest` assets,
+calling the suspend session API from Main and checking that HID callbacks run off
+Main.
+
+After publishing the AAR and building the sample with the full gate:
 
 ```sh
 nix develop -c bash tools/instrumentation.sh
 ```
 
-creates the API 34 x86_64 AVD if needed, boots it headless from the
-`nix develop .#emulator` shell, and runs `:sample:connectedDebugAndroidTest`.
+The script creates the API 34 x86_64 AVD `bhwi-api34-x86_64` if needed, boots it
+headlessly through the separate `nix develop .#emulator` shell, and runs
+`:sample:connectedDebugAndroidTest`. It targets `emulator-5554`, not an attached
+phone, and stops its emulator on exit.
 
-**KVM note:** without `/dev/kvm` the script falls back to `-accel off` (full
-software emulation). Boot then takes 10-15 minutes, `system_server` can stall long
-enough for a run to fail with `Unknown API Level` or
-`Can't find service: package` (re-run; the device recovers), and a single
-instrumentation test takes ~80s. That is why the JVM suite — not the emulator — is
-what `tools/check.sh` gates on. On a host with KVM, pass `BHWI_ACCEL=auto`.
+`BHWI_ACCEL=off` is the default, even on a host with KVM. If `/dev/kvm` is usable,
+opt in explicitly:
 
-## Developing against a local bhwi checkout
+```sh
+BHWI_ACCEL=auto nix develop -c bash tools/instrumentation.sh
+```
 
-`bhwi` and `bhwi-async` are pinned to a git rev in the workspace `Cargo.toml`.
-Uncomment the `[patch."https://github.com/wizardsardine/bhwi"]` block at the bottom
-of that file to point them at a sibling checkout (`../bhwi`). Do not commit the
-patch.
+`BHWI_BOOT_TIMEOUT=1800` is the default boot/readiness timeout in seconds. The
+script checks boot completion and property/package readiness before running the
+test. Inspect `target/emulator.log` on boot failure; a successful APK build or JVM
+gate is not evidence that instrumentation ran.
 
-## Would UniFFI also work for iOS?
+### Local BHWI checkout
 
-Yes, and sharing this binding layer with a future iOS target is the recommended
-path. Verified against uniffi 0.32 with this crate:
+`Cargo.toml` selects `https://github.com/trevarj/bhwi`, branch `pairing-hook-send`;
+`Cargo.lock` records the resolved commit. For development against a sibling
+checkout, add this local override to the workspace `Cargo.toml`:
 
-- The same `bhwi-ffi-bindgen` binary emits Swift with
-  `generate --library target/release/libbhwi_ffi.so --language swift`, producing
-  `bhwi_ffi.swift`, `bhwi_ffiFFI.h` and `bhwi_ffiFFI.modulemap`. No Rust source
-  change and no second binding crate.
-- The model carries over unchanged: the exported objects become Swift classes with
-  throwing methods, so an iOS app writes the same driving loop in Swift that
-  Android writes in Kotlin, over its own transport.
+```toml
+[patch."https://github.com/trevarj/bhwi"]
+bhwi = { path = "../bhwi/bhwi" }
+bhwi-async = { path = "../bhwi/bhwi-async" }
+```
 
-Caveats, all verifiable from the generated output:
+Using that override requires intentionally updating the local lockfile before
+locked builds, for example:
 
-- Packaging is not shared. Swift needs the header and modulemap wired into an
-  XCFramework; uniffi ships a dedicated `uniffi-bindgen-swift` CLI
-  (`uniffi::uniffi_bindgen_swift()`, same `cli` feature) with `--headers`,
-  `--modulemap` and `--xcframework` flags for that. Adding it here is a second
-  `[[bin]]` in `bindgen/` when an iOS target actually exists.
-- Building the iOS `.a`/`.dylib` requires `aarch64-apple-ios` targets and Xcode, so
-  that half of the pipeline has to run on macOS.
+```sh
+nix develop -c cargo update -p bhwi -p bhwi-async
+```
+
+Do not commit the local override or the resulting local lockfile changes. The
+patch URL must match the fork selected above, not the stale commented upstream
+URL in `Cargo.toml`.
+
+## Documentation
+
+- [Native API and error boundary](bhwi-ffi/src/lib.rs).
+- [Commands, transmits, responses and error mapping](bhwi-ffi/src/types.rs).
+- [Kotlin session facade](android/lib/src/main/kotlin/com/wizardsardine/bhwi/HwiSession.kt)
+  and [command loop](android/lib/src/main/kotlin/com/wizardsardine/bhwi/Hwi.kt).
+- [Transport contracts](android/lib/src/main/kotlin/com/wizardsardine/bhwi/Transports.kt)
+  and [framing implementations](android/lib/src/main/kotlin/com/wizardsardine/bhwi/Links.kt).
+- [Swift host commands](ios/Sources/Bhwi/Hwi.swift), [sessions](ios/Sources/Bhwi/HwiSession.swift),
+  [transport contracts](ios/Sources/Bhwi/Transports.swift) and [framing](ios/Sources/Bhwi/Links.swift).
+- [Upstream BHWI design rationale](https://github.com/wizardsardine/bhwi/blob/main/docs/VISION.md).
+
+## License
+
+See [LICENSE](LICENSE).
