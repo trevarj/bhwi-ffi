@@ -4,15 +4,15 @@
 //! `bhwi::common::{Command, Transmit, Response, Error}` drives every supported device;
 //! only the constructor is per-device. The host owns the transport, the per-device wire
 //! framing, the PIN-server HTTP request and the driving loop. What crosses the FFI is
-//! `(payload bytes, encrypted flag, recipient)` out and reply bytes in.
+//! `(payload bytes, encrypted flag, recipient)` out and device/HTTP replies in.
 //!
 //! Driving model, per logical command:
 //!
-//! 1. `Interp.new_ledger()` / `new_bitbox(noise, network)` / `new_jade(network)` /
-//!    `new_coldcard(encryption)`
+//! 1. Construct the device's `Interp` (including `new_trezor` / `new_keepkey` with a
+//!    native passphrase handle and the chosen entry mode).
 //! 2. `start(command)` -> first `Transmit`
-//! 3. send `payload` to `recipient`, read the reply, feed it to `exchange(reply)` ->
-//!    next `Transmit`, or `null` when the machine is done
+//! 3. deliver device/HTTP payloads and call `exchange(reply)` -> next `Transmit`, or
+//!    `null` when done; fail closed on unexpected host requests
 //! 4. `end()` -> the typed `HwiResponse`
 //!
 //! An `Interp` runs exactly one command and is consumed by `end()`. Device state that
@@ -31,8 +31,13 @@ pub use helpers::{
     derive_addresses, psbt_summary,
 };
 pub use interp::Interp;
-pub use state::{ColdcardEncryption, NoiseConfig, NoiseHandle};
-pub use types::{HwiCommand, HwiResponse, Recipient, Transmit};
+pub use state::{
+    ColdcardEncryption, HostPassphraseHandle, NoiseConfig, NoiseHandle, SpecterFrameDecoder,
+};
+pub use types::{
+    HostRequest, HwiCommand, HwiResponse, MultisigAddressFormat, PinMatrixRequestKind, Recipient,
+    Transmit, WalletPolicy, WalletRegistration,
+};
 
 /// Bitcoin network selector, mirrored from `bitcoin::Network`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -105,6 +110,8 @@ pub enum HwiError {
     UserRefused,
     #[error("authentication refused")]
     AuthRefused,
+    #[error("device is already unlocked")]
+    DeviceAlreadyUnlocked,
     #[error("invalid input: {msg}")]
     InvalidInput { msg: String },
     #[error("bad state: {msg}")]

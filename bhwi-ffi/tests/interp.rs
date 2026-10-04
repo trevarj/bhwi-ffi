@@ -192,6 +192,24 @@ fn coldcard_protocol_errors_do_not_leak_and_release_the_lease() {
 }
 
 #[test]
+fn errors_after_runtime_start_are_terminal_and_release_the_lease() {
+    let encryption = ColdcardEncryption::new();
+    let interp = Interp::new_coldcard(encryption.clone()).unwrap();
+    // Lowering succeeds; runtime encryption fails because this connection is not unlocked.
+    assert!(matches!(
+        interp.start(HwiCommand::GetMasterFingerprint),
+        Err(HwiError::Device { .. })
+    ));
+    assert!(matches!(
+        interp.start(HwiCommand::Unlock {
+            network: Network::Testnet
+        }),
+        Err(HwiError::BadState { .. })
+    ));
+    Interp::new_coldcard(encryption).expect("runtime failure releases the lease");
+}
+
+#[test]
 fn invalid_input_leaves_the_interpreter_usable() {
     let interp = Interp::new_ledger();
     assert!(matches!(
@@ -204,6 +222,7 @@ fn invalid_input_leaves_the_interpreter_usable() {
     let error = interp
         .start(HwiCommand::SignPsbt {
             psbt_base64: "cHNidP8FAN6tvu8A".to_string(),
+            wallet_policy: None,
         })
         .expect_err("invalid PSBT key data");
     let HwiError::InvalidInput { ref msg } = error else {
@@ -373,4 +392,162 @@ fn interp_handles_are_send_and_sync() {
     assert_send_sync::<Arc<Interp>>();
     assert_send_sync::<Arc<NoiseHandle>>();
     assert_send_sync::<Arc<ColdcardEncryption>>();
+}
+
+mod trezor_keepkey {
+    use super::*;
+    use bhwi::trezor::api::{self, MessageType};
+    use bhwi_ffi::HostPassphraseHandle;
+
+    fn frame(kind: MessageType, body: &[u8]) -> Vec<u8> {
+        api::frame(kind as u16, body)
+    }
+
+    fn device(keepkey: bool, handle: Option<Arc<HostPassphraseHandle>>) -> Arc<Interp> {
+        if keepkey {
+            Interp::new_keepkey(Network::Testnet, handle).unwrap()
+        } else {
+            Interp::new_trezor(Network::Testnet, handle, false).unwrap()
+        }
+    }
+
+    fn features(keepkey: bool) -> Vec<u8> {
+        let body = if keepkey {
+            hex::decode("0a0b6b6565706b65792e636f6d1007180a2000380140015204746573746001800100aa01074b312d3134414db201076b6565706b6579")
+        } else {
+            hex::decode("1001180d2001380140015204746573746001800100aa010131")
+        }.unwrap();
+        frame(MessageType::Features, &body)
+    }
+
+    #[test]
+    fn trezor_passphrase_modes_are_exclusive_before_cloning_the_handle() {
+        let handle = HostPassphraseHandle::new("passphrase-canary".into()).unwrap();
+        assert!(matches!(
+            Interp::new_trezor(Network::Testnet, Some(handle.clone()), true),
+            Err(HwiError::InvalidInput { .. })
+        ));
+        Interp::new_trezor(Network::Testnet, Some(handle.clone()), false).unwrap();
+        handle.clear();
+        // A cleared owner would produce BadState if cloning happened first.
+        let error = Interp::new_trezor(Network::Testnet, Some(handle), true)
+            .err()
+            .unwrap();
+        assert!(matches!(error, HwiError::InvalidInput { .. }));
+        assert!(!format!("{error:?}").contains("passphrase-canary"));
+    }
+
+    #[test]
+    fn raw_replies_require_one_exact_unpadded_frame_for_both_families() {
+        for keepkey in [false, true] {
+            let valid = features(keepkey);
+            let mut wrong_magic = valid.clone();
+            wrong_magic[0] = b'!';
+            let mut padded = valid.clone();
+            padded.extend_from_slice(b"raw-reply-canary");
+            let mut truncated = valid.clone();
+            truncated.pop();
+            let mut excessive_length = valid.clone();
+            excessive_length[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+            let mut replies = vec![wrong_magic, padded, truncated, excessive_length];
+            replies.extend((0..8).map(|len| valid[..len].to_vec()));
+            for reply in replies {
+                let interp = device(keepkey, None);
+                interp.start(HwiCommand::GetVersion).unwrap();
+                let error = interp.exchange(reply).unwrap_err();
+                assert!(
+                    matches!(error, HwiError::Device { ref msg } if msg == "malformed device protocol reply")
+                );
+                assert!(!format!("{error:?}").contains("raw-reply-canary"));
+                assert!(matches!(interp.end(), Err(HwiError::BadState { .. })));
+                assert!(matches!(
+                    interp.exchange(valid.clone()),
+                    Err(HwiError::BadState { .. })
+                ));
+            }
+            let interp = device(keepkey, None);
+            interp.start(HwiCommand::GetVersion).unwrap();
+            assert!(interp.exchange(valid).unwrap().is_none());
+            assert!(matches!(interp.end().unwrap(), HwiResponse::Info { .. }));
+        }
+    }
+
+    #[test]
+    fn keepkey_profile_rejections_leave_the_same_interpreter_usable() {
+        use bhwi_ffi::{AddressFormat, MultisigAddressFormat};
+        let interp = device(true, None);
+        for command in [
+            HwiCommand::DisplayAddress {
+                path: "m/84'/1'/0'/0/7".into(),
+                display: true,
+                format: Some(AddressFormat::Taproot),
+            },
+            HwiCommand::DisplayAddress {
+                path: "m/86'/1'/0'/0/7".into(),
+                display: true,
+                format: None,
+            },
+            HwiCommand::DisplayMultisigAddress {
+                threshold: 1,
+                sorted: false,
+                format: MultisigAddressFormat::Wit,
+                keys: vec!["[f5acc2fd/48'/1'/0'/2'/0/7]0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".into()],
+            },
+        ] {
+            assert!(matches!(interp.start(command), Err(HwiError::InvalidInput { .. })));
+        }
+        interp.start(HwiCommand::GetVersion).unwrap();
+        assert!(interp.exchange(features(true)).unwrap().is_none());
+        assert!(matches!(interp.end().unwrap(), HwiResponse::Info { .. }));
+    }
+
+    #[test]
+    fn pin_rejection_cancellation_and_invalid_positions_are_distinct_and_redacted() {
+        for keepkey in [false, true] {
+            for positions in ["", "0", "10", "１２", "pin-canary"] {
+                let interp = device(keepkey, None);
+                let cmd = HwiCommand::SendPin {
+                    positions: positions.into(),
+                };
+                assert_eq!(format!("{cmd:?}"), "SendPin(<redacted>)");
+                let error = interp.start(cmd).unwrap_err();
+                assert!(matches!(error, HwiError::InvalidInput { .. }));
+                assert!(!format!("{error:?}").contains(positions) || positions.is_empty());
+                interp
+                    .start(HwiCommand::GetVersion)
+                    .expect("invalid input did not start a command");
+            }
+            for code in [4, 6] {
+                let interp = device(keepkey, None);
+                interp
+                    .start(HwiCommand::SendPin {
+                        positions: "1234".into(),
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    interp.exchange(frame(MessageType::Failure, &[8, code])),
+                    Err(HwiError::AuthRefused)
+                ));
+            }
+            let interp = device(keepkey, None);
+            interp
+                .start(HwiCommand::SendPin {
+                    positions: "1234".into(),
+                })
+                .unwrap();
+            let next = interp
+                .exchange(frame(MessageType::Failure, &[8, 7]))
+                .unwrap();
+            if keepkey {
+                assert!(next.is_none());
+            } else {
+                assert_eq!(next.unwrap().payload, api::get_features());
+                assert!(interp.exchange(features(false)).unwrap().is_none());
+            }
+            assert!(matches!(
+                interp.end().unwrap(),
+                HwiResponse::DeviceAction { success: false }
+            ));
+        }
+    }
 }

@@ -1,9 +1,8 @@
 //! Checked-in vectors for host bindings, at both levels of the split.
 //!
 //! * Report level: the real `bhwi-async` Ledger device driven over an in-memory HID
-//!   channel. Hosts reimplement that framing, so they need the exact reports. This is
-//!   the only place `bhwi-async` is used, and it is a dev-dependency: no I/O ships in
-//!   the library.
+//!   channel. Hosts reimplement that framing, so they need the exact reports.
+//!   `bhwi-async` is a dev-dependency, so no I/O ships in the library.
 //! * Transmit level: the same commands driven through `Interp`, the FFI surface hosts
 //!   call, so a driving loop can be replayed without a device.
 //!
@@ -208,14 +207,13 @@ fn ledger_refused() {
     ))
     .expect_err("device denied");
 
-    // A denied display answers with `TaskDone` instead of an address; `Interp` turns the
-    // same mismatch into `HwiError::UserRefused` (see `interp.rs`).
+    // The core preserves physical cancellation as a typed error.
     assert!(
         matches!(
             error,
-            bhwi_async::Error::Interpreter(bhwi::common::Error::NoErrorOrResult)
+            bhwi_async::Error::Interpreter(bhwi::common::Error::UserCancelled)
         ),
-        "expected a missing result, got {error:?}"
+        "expected typed cancellation, got {error:?}"
     );
     let (writes, reads) = tape.transcript();
     assert_report_fixture("ledger_refused.json", &writes, &reads, "UserRefused");

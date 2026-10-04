@@ -8,13 +8,17 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import uniffi.bhwi_ffi.AddressFormat
 import uniffi.bhwi_ffi.ColdcardEncryption
+import uniffi.bhwi_ffi.HostPassphraseHandle
 import uniffi.bhwi_ffi.HwiCommand
 import uniffi.bhwi_ffi.HwiException
 import uniffi.bhwi_ffi.HwiResponse
 import uniffi.bhwi_ffi.Interp
+import uniffi.bhwi_ffi.MultisigAddressFormat
 import uniffi.bhwi_ffi.Network
 import uniffi.bhwi_ffi.NoiseConfig
 import uniffi.bhwi_ffi.NoiseHandle
+import uniffi.bhwi_ffi.WalletPolicy
+import uniffi.bhwi_ffi.WalletRegistration
 
 /**
  * A connected device: one command at a time, over one [Link].
@@ -32,20 +36,78 @@ import uniffi.bhwi_ffi.NoiseHandle
  * `CancellationException`; [TransportException.Cancelled] is a separate adapter error.
  */
 class HwiSession private constructor(
-    private val newInterp: () -> Interp,
+    private val newInterp: (() -> Interp)?,
     private val link: Link,
     private val http: HttpBridge? = null,
     private val noise: NoiseHandle? = null,
     private val coldcard: ColdcardEncryption? = null,
     private val onPairingCode: ((String) -> Unit)? = null,
+    private val pinFamily: PinFamily? = null,
+    private val network: Network? = null,
 ) {
     /** Serialises commands: the state handles can only be leased by one `Interp` at a time. */
     private val lock = Mutex()
     private val closed = AtomicBoolean(false)
+    private var passphrase: HostPassphraseHandle? = null
+    private var onDevicePassphrase = false
+    private var passphraseConfigured = false
 
-    /** Ledger: opens the Bitcoin app. Jade/BitBox/Coldcard: authenticates the device. */
-    suspend fun unlock(network: Network) {
+    private enum class PinFamily { TREZOR, KEEPKEY }
+
+    /**
+     * Worker-only. Choose the passphrase mode before requesting an account. Null/false
+     * means an explicitly selected Standard wallet, not an unanswered passphrase choice.
+     * The session clears the supplied native owner on replacement/disconnect; the caller
+     * must not share, clear or close it while configured. Managed input Strings are not erased.
+     */
+    @Synchronized
+    fun configurePassphrase(handle: HostPassphraseHandle?, onDevice: Boolean) {
+        if (!lock.tryLock()) throw HwiException.BadState("a command is running")
+        try {
+            requireOpen()
+            val family = pinFamily ?: throw HwiException.BadState("this session has no passphrase options")
+            if (family == PinFamily.KEEPKEY && onDevice) {
+                throw HwiException.InvalidInput("KeepKey does not support on-device passphrase entry")
+            }
+            if (onDevice && handle != null) {
+                throw HwiException.InvalidInput("choose host or on-device passphrase entry")
+            }
+            // Generated method calls guard destroyed wrappers; constructor argument lowering does not.
+            handle?.validate()
+            if (passphrase !== handle) passphrase?.clear()
+            passphrase = handle
+            onDevicePassphrase = onDevice
+            passphraseConfigured = true
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    /** Model capability, not the generic locked flag or passphrase-entry capability. */
+    fun supportsHostPin(info: HwiResponse.Info): Boolean = when (pinFamily) {
+        PinFamily.KEEPKEY -> true
+        PinFamily.TREZOR -> when (info.firmware) {
+            null, "1" -> true
+            "T" -> false
+            else -> throw HwiException.InvalidInput("unsupported Trezor model")
+        }
+        null -> false
+    }
+
+    /** Keep the physical channel open between the prompt and its positions acknowledgment. */
+    suspend fun promptPin(): Boolean =
+        (run(HwiCommand.PromptPin) as? HwiResponse.DeviceAction)?.success ?: unexpected()
+
+    /** Positions 1–9 on a blank keypad; false means authentication rejection. */
+    suspend fun sendPin(positions: String): Boolean =
+        (run(HwiCommand.SendPin(positions)) as? HwiResponse.DeviceAction)?.success ?: unexpected()
+
+    /** Trezor/KeepKey return their actual Info; other unlock results remain device-specific. */
+    suspend fun unlock(network: Network): HwiResponse = try {
         run(HwiCommand.Unlock(network))
+    } catch (_: HwiException.DeviceAlreadyUnlocked) {
+        // This typed outcome is benign only for unlock; do not invent an Info response.
+        HwiResponse.TaskDone
     }
 
     suspend fun getInfo(): HwiResponse.Info =
@@ -61,6 +123,28 @@ class HwiSession private constructor(
         (run(HwiCommand.DisplayAddress(path, display, addressFormat)) as? HwiResponse.Address)?.address
             ?: unexpected()
 
+    suspend fun registerWallet(name: String, descriptor: String): WalletRegistration =
+        (run(HwiCommand.RegisterWallet(name, descriptor)) as? HwiResponse.WalletRegistration)?.registration
+            ?: unexpected()
+
+    suspend fun displayDescriptorAddress(
+        index: UInt,
+        change: Boolean,
+        display: Boolean,
+        walletPolicy: WalletPolicy,
+    ): String =
+        (run(HwiCommand.DisplayDescriptorAddress(index, change, display, walletPolicy)) as? HwiResponse.Address)?.address
+            ?: unexpected()
+
+    suspend fun displayMultisigAddress(
+        threshold: UByte,
+        sorted: Boolean,
+        format: MultisigAddressFormat,
+        keys: List<String>,
+    ): String =
+        (run(HwiCommand.DisplayMultisigAddress(threshold, sorted, format, keys)) as? HwiResponse.Address)?.address
+            ?: unexpected()
+
     /**
      * Returns the standard `signmessage` base64: header byte followed by the 64-byte
      * compact signature.
@@ -68,8 +152,9 @@ class HwiSession private constructor(
     suspend fun signMessage(message: ByteArray, path: String): String =
         (run(HwiCommand.SignMessage(message, path)) as? HwiResponse.MessageSignature)?.base64 ?: unexpected()
 
-    suspend fun signPsbt(psbtBase64: String): String =
-        (run(HwiCommand.SignPsbt(psbtBase64)) as? HwiResponse.SignedPsbt)?.psbtBase64 ?: unexpected()
+    /** Returns the complete PSBT, retaining partial signatures; never finalizes or broadcasts. */
+    suspend fun signPsbt(psbtBase64: String, walletPolicy: WalletPolicy?): String =
+        (run(HwiCommand.SignPsbt(psbtBase64, walletPolicy)) as? HwiResponse.SignedPsbt)?.psbtBase64 ?: unexpected()
 
     /**
      * The BitBox02 pairing material to persist, so the next session skips the on-screen
@@ -93,12 +178,16 @@ class HwiSession private constructor(
      * I/O, or guarantee that an in-flight command cannot finish.
      *
      * For teardown, cancel the operation, unblock caller-owned platform I/O if needed,
-     * join the operation, disconnect, then dispose the transport.
+     * join the operation, disconnect (clearing its native passphrase owner), then dispose
+     * the transport. Managed input Strings and already-running clones are not erased here.
      */
+    @Synchronized
     fun disconnect() {
         if (closed.compareAndSet(false, true)) {
             noise?.close()
             coldcard?.close()
+            passphrase?.clear()
+            passphrase = null
         }
     }
 
@@ -108,7 +197,7 @@ class HwiSession private constructor(
             requireOpen()
             val pairing = noise?.let { handle -> onPairingCode?.let { Hwi.Pairing(handle, it) } }
             try {
-                Hwi.runCommand(newInterp(), cmd, link, http, pairing)
+                Hwi.runCommand(createInterp(cmd), cmd, link, http, pairing)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e // extends IllegalStateException; must not be remapped
             } catch (e: IllegalStateException) {
@@ -116,6 +205,22 @@ class HwiSession private constructor(
                 // the loop; surface that as the typed post-disconnect error, not a uniffi ISE.
                 if (closed.get()) throw HwiException.BadState("session is disconnected") else throw e
             }
+        }
+    }
+
+    @Synchronized
+    private fun createInterp(cmd: HwiCommand): Interp {
+        requireOpen()
+        if (pinFamily != null && !passphraseConfigured && when (cmd) {
+            is HwiCommand.SendPin, HwiCommand.GetMasterFingerprint, is HwiCommand.GetXpub,
+            is HwiCommand.DisplayAddress, is HwiCommand.DisplayMultisigAddress,
+            is HwiCommand.SignMessage, is HwiCommand.SignPsbt -> true
+            else -> false
+        }) throw HwiException.BadState("choose a passphrase mode before requesting an account")
+        return when (pinFamily) {
+            PinFamily.TREZOR -> Interp.newTrezor(requireNotNull(network), passphrase, onDevicePassphrase)
+            PinFamily.KEEPKEY -> Interp.newKeepkey(requireNotNull(network), passphrase)
+            null -> requireNotNull(newInterp).invoke()
         }
     }
 
@@ -137,6 +242,16 @@ class HwiSession private constructor(
 
         fun ledgerBle(ble: BleChannel): HwiSession =
             HwiSession({ Interp.newLedger() }, LedgerBleLink(ble))
+
+        /** HID and vendor-class WebUSB both supply the same physical packet channel. */
+        fun trezorUsb(channel: HidChannel, network: Network): HwiSession =
+            HwiSession(null, TrezorV1Link(channel), pinFamily = PinFamily.TREZOR, network = network)
+
+        fun keepkeyUsb(channel: HidChannel, network: Network): HwiSession =
+            HwiSession(null, TrezorV1Link(channel), pinFamily = PinFamily.KEEPKEY, network = network)
+
+        fun specterUsb(stream: SerialStream, network: Network): HwiSession =
+            HwiSession({ Interp.newSpecter(network) }, SpecterSerialLink(stream))
 
         fun coldcardUsb(hid: HidChannel): HwiSession {
             // One encryption engine per physical connection; the session key is installed

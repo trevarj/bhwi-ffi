@@ -76,5 +76,7 @@ object Hwi {
                     ?: throw HwiException.BadState("this command needs an HttpBridge for the Jade PIN server")
                 bridge.request(recipient.url, transmit.payload)
             }
+            is Recipient.Host ->
+                throw HwiException.BadState("host interaction is unsupported by this wallet host")
         }
 }

@@ -1,6 +1,12 @@
 package com.wizardsardine.bhwi
 
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withTimeoutOrNull
+import uniffi.bhwi_ffi.SpecterFrameDecoder
 
 /**
  * One logical request/response exchange with a device, whatever the wire framing
@@ -18,6 +24,75 @@ private const val HID_REPORT_LEN = 64
 private fun be16(buf: ByteArray, at: Int): Int =
     ((buf[at].toInt() and 0xff) shl 8) or (buf[at + 1].toInt() and 0xff)
 
+
+/**
+ * Trezor/KeepKey V1 packets on HID or vendor-class WebUSB, without a Linux report ID.
+ * Any incomplete/failed exchange retires this link; the caller still owns channel closure.
+ */
+class TrezorV1Link(private val channel: HidChannel) : Link {
+    private val ready = AtomicBoolean(true)
+
+    override suspend fun exchange(payload: ByteArray, encrypted: Boolean): ByteArray {
+        if (payload.size < HEADER || payload[0] != MAGIC || payload[1] != MAGIC ||
+            bodyLength(payload, 4) != payload.size - HEADER
+        ) throw TransportException.Io("trezor: invalid request frame")
+        if (!ready.compareAndSet(true, false)) throw TransportException.Disconnected()
+        currentCoroutineContext().ensureActive()
+        val report = ByteArray(HID_REPORT_LEN)
+        var offset = 0
+        while (offset < payload.size) {
+            report.fill(0)
+            report[0] = PREFIX
+            val take = minOf(CHUNK, payload.size - offset)
+            payload.copyInto(report, 1, offset, offset + take)
+            if (channel.send(report) != HID_REPORT_LEN.toUInt()) {
+                throw TransportException.Io("trezor: incomplete packet write")
+            }
+            offset += take
+            currentCoroutineContext().ensureActive()
+        }
+
+        val first = readPacket()
+        if (first[1] != MAGIC || first[2] != MAGIC) {
+            throw TransportException.Io("trezor: invalid response frame")
+        }
+        val answer = ByteArray(HEADER + bodyLength(first, 5))
+        var copied = minOf(CHUNK, answer.size)
+        first.copyInto(answer, 0, 1, 1 + copied)
+        while (copied < answer.size) {
+            val packet = readPacket()
+            val take = minOf(CHUNK, answer.size - copied)
+            packet.copyInto(answer, copied, 1, 1 + take)
+            copied += take
+        }
+        currentCoroutineContext().ensureActive()
+        ready.set(true)
+        return answer
+    }
+
+    private suspend fun readPacket(): ByteArray {
+        val packet = channel.receive(HID_REPORT_LEN.toUInt())
+        currentCoroutineContext().ensureActive()
+        if (packet.size != HID_REPORT_LEN || packet[0] != PREFIX) {
+            throw TransportException.Io("trezor: invalid 64-byte packet")
+        }
+        return packet
+    }
+
+    private fun bodyLength(frame: ByteArray, at: Int): Int {
+        var length = 0L
+        for (i in 0 until 4) length = (length shl 8) or (frame[at + i].toLong() and 0xff)
+        if (length > 65_536) throw TransportException.Io("trezor: message exceeds 65536 bytes")
+        return length.toInt()
+    }
+
+    private companion object {
+        const val HEADER = 8
+        const val CHUNK = 63
+        const val PREFIX: Byte = 0x3f
+        const val MAGIC: Byte = 0x23
+    }
+}
 /**
  * Ledger APDUs over 64-byte HID reports.
  *
@@ -307,6 +382,52 @@ class JadeSerialLink(private val stream: SerialStream) : Link {
     private companion object {
         /** Same read size the reference uses, so a chunked device behaves identically. */
         const val CHUNK = 1024
+    }
+}
+
+/**
+ * Specter-DIY serial framing is validated by the core decoder, not a second Kotlin parser.
+ * Any incomplete/failed exchange retires this link; the caller still owns stream closure.
+ */
+class SpecterSerialLink(
+    private val stream: SerialStream,
+    private val confirmationTimeoutMs: Long = 300_000,
+) : Link {
+    private val ready = AtomicBoolean(true)
+
+    init {
+        require(confirmationTimeoutMs > 0) { "confirmation timeout must be positive" }
+    }
+
+    override suspend fun exchange(payload: ByteArray, encrypted: Boolean): ByteArray {
+        // Poison before any suspension, including the write. Never consume a stale reply on retry.
+        if (!ready.compareAndSet(true, false)) throw TransportException.Disconnected()
+        val started = System.nanoTime()
+        val frame = SpecterFrameDecoder().use { decoder ->
+            withTimeoutOrNull(confirmationTimeoutMs) {
+                stream.writeAll(payload) // The interpreter already supplied CRLF framing.
+                currentCoroutineContext().ensureActive()
+                var complete: ByteArray? = null
+                while (complete == null) {
+                    val chunk = stream.read(CHUNK.toUInt())
+                    currentCoroutineContext().ensureActive()
+                    if (chunk.size > CHUNK) throw TransportException.Io("specter: serial read exceeds the requested length")
+                    if (chunk.isEmpty()) throw TransportException.Disconnected()
+                    complete = decoder.push(chunk)
+                }
+                complete
+            } ?: throw TransportException.Timeout()
+        }
+        currentCoroutineContext().ensureActive()
+        if (System.nanoTime() - started >= TimeUnit.MILLISECONDS.toNanos(confirmationTimeoutMs)) {
+            throw TransportException.Timeout()
+        }
+        ready.set(true)
+        return frame
+    }
+
+    private companion object {
+        const val CHUNK = 16 * 1024
     }
 }
 

@@ -150,7 +150,7 @@ checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 [[package]]
 name = "bhwi"
 version = "0.0.1"
-source = "git+https://github.com/trevarj/bhwi?branch=pairing-hook-send#3b82355baad9d63c9f5be0f509018ec2f940b8fc"
+source = "git+https://github.com/trevarj/bhwi?rev=baa7111d6fb76cc0da02c907ddbb75856e4aac8c#baa7111d6fb76cc0da02c907ddbb75856e4aac8c"
 dependencies = [
  "aes",
  "base64ct",
@@ -173,6 +173,7 @@ dependencies = [
  "serde_cbor",
  "serde_json",
  "thiserror 1.0.69",
+ "unicode-normalization",
  "zeroize",
  "zeroize_derive",
 ]
@@ -180,12 +181,11 @@ dependencies = [
 [[package]]
 name = "bhwi-async"
 version = "0.0.1"
-source = "git+https://github.com/trevarj/bhwi?branch=pairing-hook-send#3b82355baad9d63c9f5be0f509018ec2f940b8fc"
+source = "git+https://github.com/trevarj/bhwi?rev=baa7111d6fb76cc0da02c907ddbb75856e4aac8c#baa7111d6fb76cc0da02c907ddbb75856e4aac8c"
 dependencies = [
  "async-trait",
  "bhwi",
  "byteorder",
- "futures",
  "serde_cbor",
  "thiserror 1.0.69",
 ]
@@ -200,6 +200,7 @@ dependencies = [
  "bhwi-async",
  "futures",
  "hex",
+ "noise-protocol",
  "rand_core",
  "serde_json",
  "thiserror 1.0.69",
@@ -899,7 +900,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 [[package]]
 name = "miniscript"
 version = "13.0.0"
-source = "git+https://github.com/rust-bitcoin/rust-miniscript.git?rev=c9b0499e#c9b0499e7479b3e21a4d6829a7b85534669eb8b8"
+source = "git+https://github.com/rust-bitcoin/rust-miniscript.git?rev=ff4732e5#ff4732e5f75aa555682343cb180fa72ee3e8e9d5"
 dependencies = [
  "bech32",
  "bitcoin",
@@ -1376,6 +1377,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "toml"
 version = "1.1.4+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1425,6 +1432,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5033c97c4262335cded6d6fc3e5c18ab755e1a3dc96376350f3d8e9f009ad956"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "uniffi"

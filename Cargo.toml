@@ -7,10 +7,8 @@ authors = ["Edouard Paris <m@edouard.paris>", "Trevor Arjeski <tmarjeski@gmail.c
 license-file = "LICENSE"
 
 [workspace.dependencies]
-# Fork branch carrying the Send pairing-hook fix (pending upstream PR);
-# repoint at wizardsardine once merged.
-bhwi = { git = "https://github.com/trevarj/bhwi", branch = "pairing-hook-send" }
-bhwi-async = { git = "https://github.com/trevarj/bhwi", branch = "pairing-hook-send" }
+bhwi = { git = "https://github.com/trevarj/bhwi", rev = "baa7111d6fb76cc0da02c907ddbb75856e4aac8c", default-features = false }
+bhwi-async = { git = "https://github.com/trevarj/bhwi", rev = "baa7111d6fb76cc0da02c907ddbb75856e4aac8c" }
 async-trait = "0.1"
 futures = "0.3"
 hex = "0.4.3"
@@ -18,7 +16,3 @@ rand_core = "0.6.4"
 thiserror = "1"
 uniffi = "0.32.0"
 
-# For local development against a sibling bhwi checkout, uncomment:
-# [patch."https://github.com/wizardsardine/bhwi"]
-# bhwi = { path = "../bhwi/bhwi" }
-# bhwi-async = { path = "../bhwi/bhwi-async" }

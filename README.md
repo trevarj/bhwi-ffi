@@ -27,34 +27,162 @@ host layer and supplies a consumer sample; `tools/` contains build and verificat
 scripts. `bhwi-async` is only a test dependency, used to produce reference transport
 fixtures; its I/O and runtime integration do not ship in the native library.
 
+The native library explicitly enables all seven core families. `Cargo.toml` and
+`Cargo.lock` pin core dependencies and UniFFI; all seven have FFI constructors.
+
 ## Supported devices and capabilities
 
-The binding exposes **BitBox02, Coldcard, Jade and Ledger**. This is not a hardware
-validation matrix or a promise that every device supports every command.
+The binding exposes **BitBox02, Coldcard, Jade, Ledger, Trezor, KeepKey and Specter-DIY**.
+This is not a hardware validation matrix or a promise that every device supports every command.
 
 The current command subset is `Unlock`, `GetVersion`, `GetMasterFingerprint`,
-`GetXpub`, singlesig `DisplayAddress` by derivation path, `SignMessage` and
-`SignPsbt`. Ledger PSBT signing is unsupported because this binding does not supply
-its wallet-policy context. Setup, wipe, restore, backup, wallet registration and
-multisig address display are not exposed.
+`GetXpub`, `PromptPin`/`SendPin`, singlesig `DisplayAddress` by derivation path,
+`RegisterWallet`, `DisplayDescriptorAddress`, `DisplayMultisigAddress`, `SignMessage` and `SignPsbt`.
+PSBT signing returns the complete base64 PSBT, never an extracted transaction or
+broadcast. Setup, wipe, restore and backup are not exposed.
+
+`WalletPolicy` carries the actual policy name, complete public descriptor and
+optional Ledger-only 32-byte HMAC. Descriptors require resolved origin-bearing
+account xpubs with unhardened suffixes; hardened origins remain valid. Secrets,
+bare keys and unresolved templates are rejected. Ledger
+descriptor display uses V2 policy context, BitBox resends its policy, and Jade and
+Coldcard use the registered name. The raw multisig API takes 1–15 origin-qualified
+keys and its own `Legacy`/`ShWit`/`Wit` format enum. Jade requires public account
+xpubs with a concrete unhardened suffix and no wildcard; Trezor accepts these or
+fully derived compressed public keys. KeepKey and Coldcard require fully derived
+compressed public keys. No family accepts private, wildcard or multipath keys.
+
+Registration returns `WalletRegistration.Complete(hmac)` or
+`PendingUserConfirmation`, never a generic task result. Coldcard's enrollment
+acknowledgment is pending, not proof of device confirmation or persistence.
+Ledger registration accepts a successful completion only with exactly 64 data bytes
+and the expected lowered V2 policy ID before returning its 32-byte HMAC.
+Names are validated for the actual family before transmission. Reference Ledger
+2.4.1 permits 1–64 printable ASCII bytes and BitBox 9.26.1 permits 1–30, both
+without leading/trailing spaces; only Ledger default-policy contexts permit an
+empty name. Unsupported descriptor/raw-multisig routes fail through the core
+adapter, not a no-op.
+
+Ledger `DisplayAddress` by path is limited to standard five-level
+`purpose'/coin'/account'/change/index` paths. The pinned core selects the first
+three components as the account and the fourth/fifth as change/index; it ignores
+trailing components, so arbitrary-depth paths are not faithfully supported.
+This limitation does not apply to `GetXpub` or explicit descriptor-policy display.
+
+`SignPsbt { psbt_base64, wallet_policy }` and Kotlin
+`signPsbt(psbtBase64, walletPolicy)` require the second argument explicitly.
+Ledger always needs a V2 policy: registered wallets use the exact registered
+name/descriptor and returned nonzero 32-byte HMAC. Default singlesig instead uses
+an **empty name and no HMAC**, with one origin-bearing account xpub, the matching
+`pkh`/`sh(wpkh)`/`wpkh`/key-only `tr` wrapper, exactly hardened
+purpose/coin/account, account ≤100, and `/<0;1>/*`. The xpub chain must match the
+origin coin type. The active Bitcoin app still verifies its network, internal
+fingerprint and complete account xpub; the binding cannot prove device ownership
+from a supplied fingerprint. Signing does not impose the default address-display
+index ceiling of 50,000. A named policy without its HMAC, a zero-filled token or a
+nonstandard no-HMAC policy fails before transport; signing never auto-registers.
+
+BitBox script/multisig signing resends its registered policy; singlesig can pass
+`null`. Jade, Coldcard, Trezor and KeepKey validate a supplied public policy but retain
+the core's context-free full-PSBT flow. An HMAC on any non-Ledger interpreter is rejected.
+The result gate binds the returned unsigned transaction to the original request and
+preserves existing final scriptSig/witness fields and ECDSA/Taproot signatures,
+rather than silently merging or overwriting them. Standard finalized-input cleanup
+is allowed only when the exact original signature bytes remain as a returned final
+witness item or scriptSig data push. Newly added ECDSA and Taproot partial/key/script
+signatures must match the **original** input's requested sighash (implicit ECDSA
+`ALL` versus Taproot `DEFAULT`); returned metadata cannot override that request.
+Foreign nondefault requests and unchanged signatures are not blanket-rejected.
+This is a fail-closed **result-boundary** check, not pre-device/preapproval protection,
+independent signature validation or a consensus/script engine. New final-only
+stacks are not decoded to establish their sighash modes. The consuming wallet must
+independently verify the complete final spend and device result before using it.
+
+Specter signing supplies `DeviceContext::Specter` when a public policy is provided.
+The pinned core accepts this context but does not serialize it in the signing
+request; it is not independent host-side policy verification.
 
 Device-free helpers build singlesig descriptors (`build_singlesig_descriptor`),
 derive receive/change addresses (`derive_addresses`) and inspect PSBTs
 (`psbt_summary`). Generated Kotlin names are `buildSinglesigDescriptor`,
 `deriveAddresses` and `psbtSummary`.
 
+
+### Trezor and KeepKey authentication
+
+`Interp.new_trezor(network, handle, on_device_passphrase)` and
+`new_keepkey(network, handle)` copy a normalized native `HostPassphraseHandle`.
+Trezor rejects a host handle together with on-device entry before cloning the handle.
+The handle constructor enforces ≤50 NFKD UTF-8 bytes; `clear()` drops its zeroizing
+native owner, and a cleared handle fails with `BadState`. There is no secret export.
+`validate()` checks a live native owner without copying its secret. Session
+configuration uses this method's generated object-lifetime guard before storing a
+candidate; a destroyed managed wrapper is rejected before native handle lowering.
+Interpreter clones zeroize independently on drop. Managed input Strings and
+protocol copies are **not** covered by a total-zeroization guarantee.
+
+`trezorUsb(channel, network)` and `keepkeyUsb(channel, network)` start without
+secrets or a selected passphrase mode. On a worker, call `configurePassphrase(handle, onDevice)`
+before SendPin/account commands; an unanswered choice fails with BadState. It rejects
+busy/disconnected sessions, cleared/closed owners and KeepKey's unsupported on-device mode.
+Null/false is an explicitly selected Standard wallet. Choose on-device entry only
+from actual Info capability data.
+Replacement validation preserves the previous configuration on failure. The session
+clears its native owner on replacement/disconnect; callers must not share, clear or
+close that handle while configured.
+`unlock()` returns the actual typed response, including Info; benign
+AlreadyUnlocked returns TaskDone only at that unlock boundary.
+
+`supportsHostPin(info)` is true for KeepKey and Trezor's legacy One model
+(`firmware == null` or `"1"`), false for `"T"`, and rejects unknown Trezor models.
+A locked T may still report `needs_pin_sent=true`: do not show it a host keypad.
+One/KeepKey use `promptPin()` then `sendPin(positions)` over the **same physical
+connection**, without intervening Initialize/unlock. Positions are digits 1–9 on
+a blank keypad, not the literal PIN. False means authentication rejection.
+PIN commands do not overwrite the chosen future passphrase mode; ordinary unlock
+uses no recovery host events, seed-administration API or FFI-owned dialogs.
+Registration and descriptor address display are explicitly unsupported for these
+two families; use the family-specific concrete multisig shapes above. KeepKey
+supports only sorted multisig and no Taproot address display. Trezor Taproot signing
+support is established only for key-only/key-path spends: Taproot trees and
+script-path spends are unestablished, not advertised as supported or independently
+verified by this wrapper.
+Cancel, unblock I/O and join before disconnecting/clearing the native handle.
+
+
+### Specter-DIY serial
+
+`Interp.new_specter(network)` and `HwiSession.specterUsb(stream, network)` use the
+actual core interpreter. Unlock returns the actual fingerprint, not invented Info;
+the protocol has no version query. Descriptor display requires a public Specter
+policy and `display=true`; Taproot display and raw multisig are unsupported.
+Names must be nonempty without control characters or `&`, with no invented length
+limit. Registration is `Complete(null)` only for exact firmware `success`;
+user cancellation remains typed `UserRefused`.
+
+`SpecterSerialLink` writes already-framed requests unchanged and uses one exported
+`SpecterFrameDecoder` per exchange. The core validates ACK, trailing bytes and
+4 MiB payload / 4 MiB+7 raw frame limits; incomplete means read more. Decoder
+completion/error is terminal. The monotonic 300-second default deadline includes
+the write. Timeout, cancellation, EOF, write/parser failure retires the link
+permanently; only a complete valid frame allows reuse. The caller still closes I/O.
+
+
+
 ## Using the bindings
 
 ### Interpreter lifecycle
 
 An `Interp` runs one command against one device. Only construction is device-specific:
-`new_ledger`, `new_coldcard`, `new_bitbox` or `new_jade`. The shared lifecycle is
+`new_ledger`, `new_coldcard`, `new_bitbox`, `new_jade`, `new_trezor`, `new_keepkey`
+or `new_specter`. The shared lifecycle is
 `start -> exchange* -> end`:
 
 1. `start(HwiCommand)` returns a `Transmit` containing `payload`, `encrypted` and
    `recipient`.
-2. The host delivers that payload and feeds the reply bytes to `exchange`. Repeat
-   until it returns no further transmit.
+2. Deliver device/PIN-server payloads and feed reply bytes to `exchange`.
+   Repeat until no further transmit is returned. Fail closed on unexpected
+   `Recipient.Host` requests; this wallet-only API has no host-response method.
 3. `end()` consumes the command state and returns a typed `HwiResponse`.
 
 The Rust boundary is synchronous and performs no I/O. Native objects are
@@ -67,21 +195,33 @@ State that survives a command lives in a separate handle: `NoiseHandle` stores
 BitBox02 pairing material, and `ColdcardEncryption` stores link-encryption state
 for one connection. An interpreter exclusively leases its handle while its command
 state is alive; a second interpreter on the same handle fails with `BadState`.
-Ending or dropping the interpreter releases the lease. Rejected local input is
-validated before native session mutation; a protocol failure retires the command
-state, so later calls on that interpreter fail with `BadState`.
+Ending or dropping the interpreter releases the lease. Pure input validation and
+family adapter lowering precede native session mutation; a rejected preflight keeps
+the same interpreter and its lease usable. Errors from actual runtime start or
+exchange retire the command state, so later calls fail with `BadState`. Runtime
+errors are not reusable preflight merely because they report `InvalidInput`.
 
 Rust's structured `HwiError` distinguishes `Device`, `UserRefused`, `AuthRefused`,
-`InvalidInput`, `BadState` and `Internal`. Device refusals and authentication
-rejections remain distinct from invalid caller input and lifecycle misuse. These
-become Kotlin `HwiException` variants. Transport and HTTP failures belong to the
-host and have no FFI error variant.
+`DeviceAlreadyUnlocked`, `InvalidInput`, `BadState` and `Internal`. Core
+`UserCancelled` maps directly to `UserRefused`, without parsing device strings or
+inferring refusal from missing results. `HwiSession.unlock` alone treats typed
+`DeviceAlreadyUnlocked` as benign; other commands propagate it. These become Kotlin
+`HwiException` variants. Transport and HTTP failures belong to the host.
+
+`HwiResponse.Info` preserves the device's `version`, `firmware` (which can be a
+model identifier), `initialized`, `networks`, `label`,
+`on_device_passphrase_entry`, `needs_pin_sent` and `needs_passphrase_sent`, including
+unknown (`None`) values.
 
 Messages in these structured `HwiError` values do not carry raw protocol payloads
 or key material. This guarantee does **not** cover unexpected failures: UniFFI
 catches unwinding panics and reports them separately as Kotlin `InternalException`,
 which can preserve panic text. Aborts and out-of-memory failures are not made
 recoverable by that boundary.
+
+Native `WalletPolicy` and `WalletRegistration` Debug output redacts HMACs, including
+nested responses. Generated Kotlin records may still stringify registration tokens:
+**do not log these objects**, real HMACs, PINs, passphrases or complete PSBTs.
 
 The Kotlin threading and ownership contract is:
 
@@ -90,7 +230,7 @@ The Kotlin threading and ownership contract is:
   because they perform no I/O. All synchronous `HwiSession` factories are also
   worker-only: `coldcardUsb` generates native key material, `bitboxUsb` restores
   native state, and the other factories currently defer native initialization.
-- `Hwi.runCommand`, the seven `HwiSession` suspend commands and `bitboxPairing()` are
+- `Hwi.runCommand`, `HwiSession` suspend commands and `bitboxPairing()` are
   **main-safe**. They run command work in `Dispatchers.IO`; session construction
   still belongs on a worker. Keep construction, use and cleanup in one ownership
   block rather than returning a newly owned native object across a cancellable
@@ -150,26 +290,39 @@ val (fingerprint, xpub) = withContext(Dispatchers.IO) {
 ```
 
 Factories are `ledgerUsb(hid)`, `ledgerBle(ble)`, `coldcardUsb(hid)`,
-`bitboxUsb(hid, network, onPairingCode, noiseConfig)`, `jadeUsb(serial, http, network)`
-and `jadeBle(serial, http, network)`. Commands are `unlock`, `getInfo`,
-`getMasterFingerprint`, `getExtendedPubkey`, `displayAddress`, `signMessage` and
-`signPsbt`. The caller owns the transport; session cleanup does not dispose it.
+`bitboxUsb(hid, network, onPairingCode, noiseConfig)`, `jadeUsb(serial, http, network)`,
+`jadeBle(serial, http, network)`, `trezorUsb(channel, network)`, `keepkeyUsb(channel, network)`
+and `specterUsb(stream, network)`.
+Commands are `unlock`, `getInfo`, `promptPin`, `sendPin`, `getMasterFingerprint`,
+`getExtendedPubkey`, `displayAddress`, `registerWallet`, `displayDescriptorAddress`,
+`displayMultisigAddress`, `signMessage` and `signPsbt`.
+The caller owns the transport; session cleanup does not dispose it.
+
+For example, after retrieving the exact public BIP84 account:
+
+```kotlin
+val descriptor = buildSinglesigDescriptor(xpub, fingerprint, "m/84'/1'/0'", AddressFormat.NATIVE_SEGWIT, Network.TESTNET)
+val signedPsbt = session.signPsbt(unsignedPsbt, WalletPolicy("", descriptor, null)) // Ledger default, not a registered label.
+```
+
+Regenerate all bindings from this shared contract and migrate callers to the
+explicit policy argument rather than retaining the old one-argument command.
 
 ### Transports and framing
 
 Implement the interface for the platform link. Transport failures use the host-side
-`TransportException.Io`, `.Disconnected` or `.Cancelled` hierarchy, not
+`TransportException.Io`, `.Disconnected`, `.Timeout` or `.Cancelled` hierarchy, not
 `HwiException`. Adapter error messages must not expose payload bytes.
 
 | Interface | Methods | Used by |
 |---|---|---|
-| `HidChannel` | `send(report): UInt`, `receive(maxLen): ByteArray` | Ledger, Coldcard and BitBox02 USB |
-| `SerialStream` | `writeAll(data)`, `read(maxLen): ByteArray` | Jade USB serial or BLE |
+| `HidChannel` | `send(report): UInt`, `receive(maxLen): ByteArray` | Ledger, Coldcard, BitBox02 USB; Trezor/KeepKey HID or WebUSB |
+| `SerialStream` | `writeAll(data)`, `read(maxLen): ByteArray` | Jade USB serial/BLE; Specter-DIY USB serial |
 | `BleChannel` | `write(data)`, `read(): ByteArray`, `mtu(): UShort` | Ledger BLE |
 | `HttpBridge` | `request(url, body): ByteArray` | Jade PIN server |
 
 - An empty `SerialStream.read` result means **end of stream**, not "no data yet".
-  It aborts an incomplete CBOR message. Suspend until data is available, or throw
+  It aborts an incomplete message/frame. Suspend until data is available, or throw
   `TransportException.Disconnected` when the link drops.
 - `HidChannel.receive` and `SerialStream.read` may return fewer bytes than requested,
   never more.
@@ -194,6 +347,13 @@ The host layer supplies these framings:
 | `ColdcardHidLink(HidChannel)` | Length byte with `0x80` on the last chunk and `0x40` when `encrypted`. |
 | `BitBoxHidLink(HidChannel)` | U2F-HID frames carrying the HWW request/response layer, including NOTREADY retry. |
 | `JadeSerialLink(SerialStream)` | Write, then read until one complete CBOR value has arrived. |
+| `TrezorV1Link(HidChannel)` | Shared Trezor/KeepKey V1: 64-byte packets, `0x3f` + 63 bytes, zero padding; exact packet I/O, `##` + u16 BE type + u32 BE body length, body ≤65536 bytes. Returns header/body without padding; failed/cancelled exchanges permanently retire the link. |
+| `SpecterSerialLink(SerialStream)` | Core `SpecterFrameDecoder` validates a complete ACK+payload+CRLF reply, ≤4 MiB+7; whole-exchange deadline defaults to 300 seconds, failed/cancelled exchanges permanently retire the link. |
+
+Raw Trezor/KeepKey `Interp.exchange` replies must contain exactly one `##` header
+and its declared body (`8 + body length` bytes); truncated or trailing bytes retire
+the command with a redacted `Device` error. Physical-report padding is the host
+framing layer's responsibility and must not be passed to the interpreter.
 
 Only Coldcard framing signals `encrypted` on the wire. BitBox02 ignores the flag
 because its Noise encryption is already inside the interpreter's payload, as in
@@ -204,6 +364,12 @@ HTTP traffic: POST the payload to that URL as `application/json` and return the
 response body to `exchange`. `Hwi.runCommand` routes it through `HttpBridge` and
 fails with `HwiException.BadState` if no bridge was supplied; it must not go to the
 device link.
+
+`Recipient.Host` preserves a typed PIN-matrix or recovery-character request for
+fail-closed routing, never device or HTTP traffic. No currently exposed command
+produces management host prompts, and there is no host-response, recovery/setup UI
+or generic host callback. `Hwi.runCommand` rejects every unexpected host request.
+Ordinary `PromptPin`/`SendPin` remain separate wallet-authentication commands.
 
 Adding a transport for an **already exposed device/protocol** requires no Rust
 change: implement an existing channel interface and reuse its framing, or implement
@@ -303,12 +469,28 @@ the JDK and Android SDK.
 
 `publishToMavenLocal` installs `com.wizardsardine:bhwi-ffi-android:0.1.0-SNAPSHOT`
 under `~/.m2/repository/`, with its AAR, POM, Gradle module metadata and sources JAR.
-An Android consumer uses:
+For a consumer-owned repository, pass an absolute path; Gradle's publication and
+the sample's exclusive Maven Local resolution both honor the same override:
+
+```sh
+nix develop -c bash -c 'cd android && bash ./gradlew -Dmaven.repo.local=/absolute/path/.bhwi-maven :lib:publishToMavenLocal'
+nix develop -c bash tools/check.sh -Dmaven.repo.local=/absolute/path/.bhwi-maven
+```
+
+Consumers must resolve this module exclusively from that repository, without
+developer-cache or remote fallback (add alongside other dependency repositories):
 
 ```kotlin
-repositories { mavenLocal(); google(); mavenCentral() }
-dependencies { implementation("com.wizardsardine:bhwi-ffi-android:0.1.0-SNAPSHOT") }
+exclusiveContent {
+    forRepository { maven { url = uri("/absolute/path/.bhwi-maven") } }
+    filter { includeModule("com.wizardsardine", "bhwi-ffi-android") }
+}
+// In dependencies:
+implementation("com.wizardsardine:bhwi-ffi-android:0.1.0-SNAPSHOT")
 ```
+
+The full gate checks the AAR's native ABIs and generated/host classes, then compares
+the published AAR byte-for-byte with the build output before sample consumption.
 
 ### AAR contents
 
@@ -387,7 +569,7 @@ nix develop -c bash -c 'cd android && bash ./gradlew :lib:testDebugUnitTest'
 ```
 
 Coverage includes report/transmit replay, typed success and refusal, framing
-(Ledger HID/BLE, Coldcard flags, U2F/HWW and CBOR completeness), command
+(Ledger HID/BLE, Coldcard flags, U2F/HWW, Jade CBOR, Trezor/KeepKey V1 and Specter serial), command
 serialization, leases, disconnect and cancellation, structured-error redaction,
 malformed-response boundary survival and pure helpers. These are deterministic
 binding/transport checks, not validation against every physical device.
@@ -403,12 +585,18 @@ After publishing the AAR and building the sample with the full gate:
 
 ```sh
 nix develop -c bash tools/instrumentation.sh
+# Or use an already running target without starting or stopping an emulator:
+ANDROID_SERIAL=emulator-5558 nix develop -c bash tools/instrumentation.sh
 ```
 
-The script creates the API 34 x86_64 AVD `bhwi-api34-x86_64` if needed, boots it
-headlessly through the separate `nix develop .#emulator` shell, and runs
-`:sample:connectedDebugAndroidTest`. It targets `emulator-5554`, not an attached
-phone, and stops its emulator on exit.
+Without `ANDROID_SERIAL`, the script creates the API 34 x86_64 AVD
+`bhwi-api34-x86_64` if needed, boots it headlessly through the separate
+`nix develop .#emulator` shell, and runs `:sample:connectedDebugAndroidTest`.
+It owns and pins `emulator-5554` and stops that emulator on exit; an already present
+device at that port is rejected rather than taken over. With `ANDROID_SERIAL`,
+it requires that exact running, authorized device, pins all ADB/Gradle operations
+to it, and never launches or kills an emulator. The script also forwards
+`-Dmaven.repo.local=/absolute/path/.bhwi-maven` when testing an overridden publication.
 
 `BHWI_ACCEL=off` is the default, even on a host with KVM. If `/dev/kvm` is usable,
 opt in explicitly:
@@ -424,9 +612,8 @@ gate is not evidence that instrumentation ran.
 
 ### Local BHWI checkout
 
-`Cargo.toml` selects `https://github.com/trevarj/bhwi`, branch `pairing-hook-send`;
-`Cargo.lock` records the resolved commit. For development against a sibling
-checkout, add this local override to the workspace `Cargo.toml`:
+For a sibling core checkout, add this local override to the workspace `Cargo.toml`;
+its patch URL must match the pinned dependency URL:
 
 ```toml
 [patch."https://github.com/trevarj/bhwi"]
@@ -441,9 +628,7 @@ locked builds, for example:
 nix develop -c cargo update -p bhwi -p bhwi-async
 ```
 
-Do not commit the local override or the resulting local lockfile changes. The
-patch URL must match the fork selected above, not the stale commented upstream
-URL in `Cargo.toml`.
+Do not commit the local override or the resulting local lockfile changes.
 
 ## Documentation
 

@@ -1,5 +1,5 @@
-//! Device state that outlives a single command: BitBox noise pairing and the Coldcard
-//! link-encryption engine.
+//! Device state that outlives a single command: BitBox noise pairing, Coldcard
+//! link encryption and native normalized passphrase options.
 //!
 //! Both interpreters borrow their state mutably (`BitBoxInterpreter<'a>`,
 //! `ColdcardInterpreter<'a>`), which no FFI can express. Instead of extending the borrow
@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use bhwi::bitbox::noise::{NoiseConfigData, NoiseState, PairingCodeHook};
 use bhwi::coldcard::encrypt::Engine;
+use bhwi::passphrase::HostPassphrase;
 
 use crate::HwiError;
 
@@ -212,9 +213,135 @@ impl ColdcardEncryption {
     }
 }
 
+/// A native, normalized passphrase owner. Each interpreter owns an independent
+/// zeroizing clone; cancel and join it before clearing this handle on disconnect.
+#[derive(uniffi::Object)]
+pub struct HostPassphraseHandle {
+    passphrase: Mutex<Option<HostPassphrase>>,
+}
+
+impl HostPassphraseHandle {
+    pub(crate) fn clone_passphrase(&self) -> Result<HostPassphrase, HwiError> {
+        self.passphrase
+            .lock()
+            .map_err(|_| HwiError::internal("passphrase lock poisoned"))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| HwiError::bad_state("passphrase handle is cleared"))
+    }
+}
+
+#[uniffi::export]
+impl HostPassphraseHandle {
+    #[uniffi::constructor]
+    pub fn new(text: String) -> Result<Arc<Self>, HwiError> {
+        let passphrase = HostPassphrase::new(text);
+        if passphrase.byte_len() > 50 {
+            return Err(HwiError::invalid(
+                "passphrase exceeds 50 normalized UTF-8 bytes",
+            ));
+        }
+        Ok(Arc::new(Self {
+            passphrase: Mutex::new(Some(passphrase)),
+        }))
+    }
+
+    /// Checks the native owner's lifetime without copying its secret.
+    pub fn validate(&self) -> Result<(), HwiError> {
+        self.passphrase
+            .lock()
+            .map_err(|_| HwiError::internal("passphrase lock poisoned"))?
+            .as_ref()
+            .map(|_| ())
+            .ok_or_else(|| HwiError::bad_state("passphrase handle is cleared"))
+    }
+
+    /// Drops the native owner; it cannot erase clones already held by interpreters.
+    pub fn clear(&self) {
+        self.passphrase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
+/// One Specter serial reply. Completion or a framing error permanently retires it.
+#[derive(uniffi::Object)]
+pub struct SpecterFrameDecoder {
+    decoder: Mutex<Option<bhwi::specter::ResponseDecoder>>,
+}
+
+#[uniffi::export]
+impl SpecterFrameDecoder {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            decoder: Mutex::new(Some(bhwi::specter::ResponseDecoder::default())),
+        })
+    }
+
+    /// None means read more, never interpreter completion. Returns canonical raw framing.
+    pub fn push(&self, bytes: Vec<u8>) -> Result<Option<Vec<u8>>, HwiError> {
+        let mut guard = self
+            .decoder
+            .lock()
+            .map_err(|_| HwiError::internal("Specter decoder lock poisoned"))?;
+        let decoder = guard
+            .as_mut()
+            .ok_or_else(|| HwiError::bad_state("Specter decoder is retired"))?;
+        match decoder.push(&bytes) {
+            Ok(None) => Ok(None),
+            Ok(Some(payload)) => {
+                *guard = None;
+                let mut frame = Vec::with_capacity(payload.len() + 7);
+                frame.extend_from_slice(b"ACK\r\n");
+                frame.extend_from_slice(&payload);
+                frame.extend_from_slice(b"\r\n");
+                Ok(Some(frame))
+            }
+            Err(error) => {
+                *guard = None;
+                Err(crate::types::map_error(
+                    error.into(),
+                    crate::types::DeviceKind::Specter,
+                ))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passphrases_are_normalized_bounded_and_independently_owned() {
+        for text in ["a".repeat(50), "\u{e9}".repeat(16)] {
+            HostPassphraseHandle::new(text).expect("normalized byte limit");
+        }
+        for text in ["a".repeat(51), "\u{e9}".repeat(17), "\u{fb03}".repeat(17)] {
+            assert!(matches!(
+                HostPassphraseHandle::new(text),
+                Err(HwiError::InvalidInput { .. })
+            ));
+        }
+        let handle = HostPassphraseHandle::new("caf\u{e9}".into()).unwrap();
+        handle.validate().unwrap();
+        let first = handle.clone_passphrase().unwrap();
+        let second = handle.clone_passphrase().unwrap();
+        assert_eq!(first.as_str(), "cafe\u{301}");
+        assert_ne!(first.as_str().as_ptr(), second.as_str().as_ptr());
+        handle.clear();
+        handle.clear();
+        assert!(matches!(handle.validate(), Err(HwiError::BadState { .. })));
+        assert!(matches!(
+            handle.clone_passphrase(),
+            Err(HwiError::BadState { .. })
+        ));
+        assert_eq!(first.as_str(), second.as_str());
+        assert_eq!(format!("{first:?}"), "HostPassphrase(<redacted>)");
+        // Both independently owned HostPassphrase values zeroize on drop in the core.
+    }
 
     #[test]
     fn noise_config_round_trips() {

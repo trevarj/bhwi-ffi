@@ -25,7 +25,8 @@ SDK aapt2; the SDK is read-only, so respect the configured build-tools version.
 For code, host, packaging or build changes:
 
 ```sh
-nix develop -c bash tools/check.sh
+repo=$(mktemp -d)
+nix develop -c bash tools/check.sh "-Dmaven.repo.local=$repo" --refresh-dependencies
 ```
 
 The gate runs, in order:
@@ -38,7 +39,8 @@ The gate runs, in order:
 6. AAR JNI/class checks and Maven Local AAR/POM/module/sources checks.
 7. Sample and instrumentation APK assembly.
 
-This writes build products and `~/.m2` artifacts. It neither boots an emulator nor
+This writes build products and publication artifacts in the selected absolute repository
+(`~/.m2/repository` when no override is supplied). It neither boots an emulator nor
 runs instrumentation, Swift checks or physical-device signing. Pair it with a
 focused exercise of the changed consumer behavior; a gate pass alone does not
 establish a new transport/runtime/signing claim.
@@ -70,21 +72,28 @@ normal validation. `bhwi-ffi/tests/fixtures.rs` regenerates on **any presence** 
 that variable, and writes missing fixture files even without it. Intentional
 regeneration is a reviewed protocol/data change, not a way to make drift pass.
 
-## Emulator startup versus instrumentation
+## Android target selection and instrumentation
 
-After the full gate has published the AAR and assembled the APKs:
+After the full gate has published the AAR and assembled the APKs, use the same repository:
 
 ```sh
-nix develop -c bash tools/instrumentation.sh
+# Default: script-owned emulator.
+nix develop -c bash tools/instrumentation.sh "-Dmaven.repo.local=$repo"
 # Only when /dev/kvm is usable; default acceleration is off.
-BHWI_ACCEL=auto nix develop -c bash tools/instrumentation.sh
+BHWI_ACCEL=auto nix develop -c bash tools/instrumentation.sh "-Dmaven.repo.local=$repo"
+# Alternatively: an explicitly selected, already running authorized compatible target.
+ANDROID_SERIAL=emulator-5558 nix develop -c bash tools/instrumentation.sh "-Dmaven.repo.local=$repo"
 ```
 
-Choose one invocation. The script uses the separate `nix develop .#emulator`
-shell, creates the API 34 x86_64 AVD if needed, targets `emulator-5554`, waits for
-boot completion **and** property/package readiness, then runs
-`:sample:connectedDebugAndroidTest`. It stops its emulator on exit. Keep that
-emulator target free; this command does not target an attached phone.
+Choose one invocation. Without `ANDROID_SERIAL`, the script uses the separate
+`nix develop .#emulator` shell, creates the API 34 x86_64 AVD if needed, targets
+`emulator-5554`, waits for boot completion **and** property/package readiness, then
+runs `:sample:connectedDebugAndroidTest`. It stops only its owned emulator on exit;
+an existing target at that port is rejected rather than taken over.
+With `ANDROID_SERIAL`, it requires that exact running, authorized device, pins all
+ADB/Gradle operations to it, and never launches or stops an emulator. Select only
+an authorized target; an explicit serial can target a compatible attached phone.
+The script forwards the publication repository override to Gradle.
 
 Report startup/readiness separately from instrumentation execution and results.
 Default `BHWI_BOOT_TIMEOUT=1800` allows slow software emulation; inspect

@@ -16,10 +16,13 @@ sealed class TransportException(message: String) : kotlin.Exception(message) {
 
     /** The adapter aborted the operation; distinct from coroutine `CancellationException`. */
     class Cancelled : TransportException("operation cancelled")
+
+    /** The whole device-confirmation exchange exceeded its deadline. */
+    class Timeout : TransportException("device confirmation timed out")
 }
 
 /**
- * Raw HID report channel (Ledger / Coldcard / BitBox02 over USB).
+ * Physical 64-byte packet channel (HID or Trezor/KeepKey vendor-class WebUSB).
  *
  * Facade-driven callbacks run in the command's IO context, without fixed worker-thread
  * identity. Cooperate with cancellation and marshal platform/UI callbacks yourself.
@@ -39,7 +42,7 @@ interface HidChannel {
 }
 
 /**
- * Byte stream for Jade, bridged from either USB serial or BLE.
+ * Byte stream for Jade USB/BLE or Specter-DIY USB serial.
  *
  * Facade-driven callbacks run in the command's IO context, without fixed worker-thread
  * identity. Cooperate with cancellation and marshal platform/UI callbacks yourself.
@@ -52,9 +55,8 @@ interface SerialStream {
      * Read up to [maxLen] bytes. Returning fewer is fine; returning more is an error.
      *
      * An empty (0-byte) result means end of stream, i.e. the device is gone: it aborts the
-     * in-flight command with "stream ended before complete CBOR message". "No data yet"
-     * must **not** return empty — suspend until at least one byte is available, or throw
-     * [TransportException.Disconnected] if the link dropped.
+     * in-flight command. "No data yet" must **not** return empty — suspend until at least
+     * one byte is available, or throw [TransportException.Disconnected] if the link dropped.
      */
     suspend fun read(maxLen: UInt): ByteArray
 }

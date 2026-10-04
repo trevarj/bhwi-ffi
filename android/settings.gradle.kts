@@ -11,10 +11,12 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        // `:sample` consumes the published AAR, not the project, so the consumption path
-        // is exercised exactly as an app would. Repositories must be declared here
-        // because of FAIL_ON_PROJECT_REPOS above.
-        mavenLocal()
+        // The sample resolves this artifact only from the publication repository.
+        // Gradle's mavenLocal honors -Dmaven.repo.local; otherwise local dev uses ~/.m2.
+        exclusiveContent {
+            forRepository { mavenLocal() }
+            filter { includeModule("com.wizardsardine", "bhwi-ffi-android") }
+        }
     }
 }
 

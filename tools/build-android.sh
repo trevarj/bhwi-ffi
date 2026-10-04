@@ -9,6 +9,10 @@ cd "$root"
 
 jni_libs=android/lib/src/main/jniLibs
 kotlin_out=android/lib/src/main/kotlin
+if [ "$#" -ne 0 ]; then
+  echo "usage: $0" >&2
+  exit 1
+fi
 
 # Wipe generated trees so a removed ABI or renamed type cannot survive a rebuild.
 rm -rf "$jni_libs" "$kotlin_out/uniffi"

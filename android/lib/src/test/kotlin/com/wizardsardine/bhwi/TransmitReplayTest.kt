@@ -8,12 +8,14 @@ import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.bhwi_ffi.ColdcardEncryption
+import uniffi.bhwi_ffi.HostRequest
 import uniffi.bhwi_ffi.HwiCommand
 import uniffi.bhwi_ffi.HwiException
 import uniffi.bhwi_ffi.HwiResponse
 import uniffi.bhwi_ffi.InternalException
 import uniffi.bhwi_ffi.Interp
 import uniffi.bhwi_ffi.Network
+import uniffi.bhwi_ffi.PinMatrixRequestKind
 import uniffi.bhwi_ffi.Recipient
 import uniffi.bhwi_ffi.Transmit
 
@@ -110,7 +112,7 @@ class TransmitReplayTest {
     }
 
     /**
-     * Jade's PIN-server payloads are the one thing that must not go to the device link.
+     * Jade's PIN-server payloads must not go to the device link.
      * Tested on the routing step itself: no real device produces such a transmit without a
      * full Jade handshake first.
      */
@@ -132,6 +134,22 @@ class TransmitReplayTest {
     fun `a PinServer transmit without an HttpBridge is a BadState`() = runBlocking<Unit> {
         val transmit = Transmit("0102".unhex(), false, Recipient.PinServer("http://pin.example/start"))
         assertFailsWith<HwiException.BadState> { Hwi.deliver(transmit, DeadLink(), null) }
+    }
+
+    @Test
+    fun `host PIN and recovery requests fail closed without device or HTTP IO`() = runBlocking<Unit> {
+        val bridge = object : HttpBridge {
+            override suspend fun request(url: String, body: ByteArray): ByteArray =
+                throw AssertionError("a host prompt reached HTTP")
+        }
+        val requests = listOf(
+            HostRequest.PinMatrix(PinMatrixRequestKind.Current),
+            HostRequest.RecoveryCharacter(11u, 3u),
+        )
+        for (request in requests) {
+            val transmit = Transmit(ByteArray(0), false, Recipient.Host(request))
+            assertFailsWith<HwiException.BadState> { Hwi.deliver(transmit, DeadLink(), bridge) }
+        }
     }
 
     @Test

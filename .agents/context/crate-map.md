@@ -10,26 +10,24 @@ Paths below are relative to the repository root. Start with the
 | `bhwi-ffi/src/lib.rs` | UniFFI exports, network/address types and structured error boundary. |
 | `bhwi-ffi/src/types.rs` | Commands, responses, transmits, validation and device-error mapping. |
 | `bhwi-ffi/src/interp.rs` | Synchronous command lifecycle and leased device-state borrowing. |
-| `bhwi-ffi/src/state.rs` | BitBox Noise pairing, Coldcard connection encryption and exclusive leases. |
+| `bhwi-ffi/src/state.rs` | BitBox Noise pairing, Coldcard connection encryption, exclusive leases and native host-passphrase ownership. |
 | `bhwi-ffi/src/helpers.rs` | Singlesig descriptors, bounded address derivation and PSBT summaries. |
 | `bhwi-ffi/tests/` | Interpreter behavior and reference fixture production/comparison. |
 | `bindgen/src/main.rs` | `bhwi-ffi-bindgen`, matched to the library's UniFFI dependency. |
 
 These are the two Cargo workspace members: `bhwi-ffi` (cdylib/rlib) and `bindgen`.
 `bhwi-async` is a test dependency for reference framing, not shipped host I/O.
-`Cargo.toml` selects the `trevarj/bhwi` fork's `pairing-hook-send` branch;
-`Cargo.lock` fixes the revision. The sibling checkout is not automatically that
-API. Use the README's local-override instructions only when needed; its matching
-fork URL supersedes the stale commented patch URL in `Cargo.toml`. Dependency
-updates and local override/lockfile changes are not routine validation.
+`Cargo.toml`/`Cargo.lock` pin the core dependencies. Sibling checkouts require the
+README's local override; dependency and local lockfile updates are not validation.
 
 ## Kotlin and Android
 
 Handwritten sources live under `android/lib/src/main/kotlin/com/wizardsardine/bhwi/`:
-`Transports.kt` defines channels, `Link`, HTTP and transport errors; `Links.kt`
-implements Ledger HID/BLE, Coldcard HID, BitBox U2F/HWW and Jade serial framing;
-`Cbor.kt` finds complete Jade messages; `Hwi.kt` drives commands and recipient
-routing; `HwiSession.kt` serializes commands and owns state, not transport.
+`Transports.kt` defines channels, HTTP and transport errors; `Links.kt` defines `Link`
+and implements Ledger HID/BLE, Coldcard HID, BitBox U2F/HWW, Jade serial,
+Trezor/KeepKey V1 and Specter serial framing; `Cbor.kt` finds complete Jade messages;
+`Hwi.kt` drives commands and recipient routing; `HwiSession.kt` serializes commands
+and owns state, not transport.
 These interfaces are not real Android USB/BLE discovery or permission adapters.
 
 Generated `android/lib/src/main/kotlin/uniffi/bhwi_ffi/bhwi_ffi.kt` and
@@ -55,7 +53,7 @@ JVM distribution.
   arbitrary recipient routing. `bhwi-ffi/tests/fixtures.rs` owns their comparison.
 - `tools/build-android.sh`: both Android native ABIs, Linux host library and Kotlin
   generation. `tools/check.sh`: non-emulator gate and local publication.
-  `tools/instrumentation.sh`: Android emulator boot/readiness and ART replay.
+  `tools/instrumentation.sh`: authorized selected-device or owned-emulator ART replay.
 - `flake.nix`/`flake.lock`, `rust-toolchain.toml`, Cargo manifests/lockfile and the
   Gradle files/wrapper are the toolchain-pin authorities; do not duplicate every
   version here. Current scripts use Linux `.so` paths. See
@@ -63,11 +61,15 @@ JVM distribution.
 
 ## Current support boundaries
 
-The experimental native API exposes BitBox02, Coldcard, Jade and Ledger, with
-Unlock, version, fingerprint, xpub, singlesig address display, message signing and
-PSBT signing. An enum variant is not proof every device supports it. Ledger PSBT
-signing lacks wallet-policy context; setup/wipe/restore/backup, wallet registration
-and multisig address display are absent. Helpers do not fill those gaps.
+The experimental native API exposes BitBox02, Coldcard, Jade, Ledger, Trezor,
+KeepKey and Specter-DIY. Commands include unlock, version, fingerprint, xpub,
+singlesig address display, message/PSBT signing, wallet registration and
+descriptor/raw-multisig address display, with family-specific unsupported routes.
+Ledger signing carries validated default/registered wallet-policy context.
+Trezor/KeepKey expose PIN/passphrase authentication but reject registration and
+descriptor display; Specter rejects version/displayed-xpub/message signing and raw multisig.
+Setup/wipe/restore/backup remain absent. Helpers do not fill unsupported routes;
+an enum variant is not proof every device supports it.
 
 Kotlin generation, host code, packaging and replay are present; physical-device
 support requires separate evidence. Swift is generation-only in this checkout:

@@ -3,40 +3,68 @@
 use std::sync::{Arc, Mutex};
 
 use bhwi::Interpreter;
+use bhwi::bitbox::{BitBoxCommand, BitBoxInterpreter};
+use bhwi::coldcard::{ColdcardCommand, ColdcardInterpreter};
 use bhwi::common as bc;
-use bhwi::common::{BitBoxInterpreter, ColdcardInterpreter, JadeInterpreter, LedgerInterpreter};
+use bhwi::jade::{JadeCommand, JadeInterpreter};
+use bhwi::keepkey::{KeepKeyCommand, KeepKeyInterpreter};
+use bhwi::ledger::{LedgerCommand, LedgerInterpreter};
+use bhwi::specter::{SpecterCommand, SpecterInterpreter};
+use bhwi::trezor::{TrezorCommand, TrezorInterpreter};
 
-use crate::state::{ColdcardEncryption, NoiseHandle};
-use crate::types::{DeviceKind, Expect, HwiCommand, HwiResponse, Transmit, map_error};
+use crate::state::{ColdcardEncryption, HostPassphraseHandle, NoiseHandle};
+use crate::types::{DeviceKind, Expect, HwiCommand, HwiResponse, Plan, Transmit, map_error};
 use crate::{HwiError, Network};
+
+// Lower once before mutating the session; core requires a family-specific conversion error.
+struct Ready<C>(C);
+
+macro_rules! ready {
+    ($command:path, $error:path) => {
+        impl TryFrom<Ready<$command>> for $command {
+            type Error = $error;
+
+            fn try_from(command: Ready<Self>) -> Result<Self, Self::Error> {
+                Ok(command.0)
+            }
+        }
+    };
+}
+
+ready!(BitBoxCommand, bhwi::bitbox::error::BitBoxError);
+ready!(ColdcardCommand, bhwi::coldcard::ColdcardError);
+ready!(JadeCommand, bc::Error);
+ready!(LedgerCommand, bhwi::ledger::LedgerError);
+ready!(TrezorCommand, bhwi::trezor::TrezorError);
+ready!(KeepKeyCommand, bhwi::trezor::TrezorError);
+ready!(SpecterCommand, bhwi::specter::SpecterError);
 
 /// The per-device interpreters behind one dispatch.
 ///
 /// The two lifetimes are `'static` lies bounded by the lease held in the session
 /// (`Session::lease`); see [`Interp::new_bitbox`] for the argument.
 enum Inner {
-    BitBox(BitBoxInterpreter<'static>),
-    Coldcard(ColdcardInterpreter<'static>),
-    Jade(JadeInterpreter),
-    Ledger(LedgerInterpreter),
+    BitBox(BitBoxInterpreter<'static, Ready<BitBoxCommand>, bc::Transmit, bc::Response, bc::Error>),
+    Coldcard(
+        ColdcardInterpreter<'static, Ready<ColdcardCommand>, bc::Transmit, bc::Response, bc::Error>,
+    ),
+    Jade(JadeInterpreter<Ready<JadeCommand>, bc::Transmit, bc::Response, bc::Error>),
+    Ledger(LedgerInterpreter<Ready<LedgerCommand>, bc::Transmit, bc::Response, bc::Error>),
+    Trezor(TrezorInterpreter<Ready<TrezorCommand>, bc::Transmit, bc::Response, bc::Error>),
+    KeepKey(KeepKeyInterpreter<Ready<KeepKeyCommand>, bc::Transmit, bc::Response, bc::Error>),
+    Specter(SpecterInterpreter<Ready<SpecterCommand>, bc::Transmit, bc::Response, bc::Error>),
 }
 
 impl Inner {
-    fn start(&mut self, command: bc::Command) -> Result<bc::Transmit, bc::Error> {
-        match self {
-            Self::BitBox(interpreter) => interpreter.start(command),
-            Self::Coldcard(interpreter) => interpreter.start(command),
-            Self::Jade(interpreter) => interpreter.start(command),
-            Self::Ledger(interpreter) => interpreter.start(command),
-        }
-    }
-
     fn exchange(&mut self, data: Vec<u8>) -> Result<Option<bc::Transmit>, bc::Error> {
         match self {
             Self::BitBox(interpreter) => interpreter.exchange(data),
             Self::Coldcard(interpreter) => interpreter.exchange(data),
             Self::Jade(interpreter) => interpreter.exchange(data),
             Self::Ledger(interpreter) => interpreter.exchange(data),
+            Self::Trezor(interpreter) => interpreter.exchange(data),
+            Self::KeepKey(interpreter) => interpreter.exchange(data),
+            Self::Specter(interpreter) => interpreter.exchange(data),
         }
     }
 
@@ -46,13 +74,16 @@ impl Inner {
             Self::Coldcard(interpreter) => interpreter.end(),
             Self::Jade(interpreter) => interpreter.end(),
             Self::Ledger(interpreter) => interpreter.end(),
+            Self::Trezor(interpreter) => interpreter.end(),
+            Self::KeepKey(interpreter) => interpreter.end(),
+            Self::Specter(interpreter) => interpreter.end(),
         }
     }
 }
 
 /// The lease an interpreter holds on the device state it borrows, released on drop.
 enum StateLease {
-    /// Ledger and Jade are stateless between commands.
+    /// These interpreters own their state rather than borrowing a host handle.
     None,
     Noise(Arc<NoiseHandle>),
     Coldcard(Arc<ColdcardEncryption>),
@@ -81,7 +112,125 @@ struct Session {
     started: bool,
     finished: bool,
     expect: Expect,
-    user_action: bool,
+    prior_inputs: Vec<bhwi::bitcoin::psbt::Input>,
+    prior_unsigned_tx: Option<bhwi::bitcoin::Wtxid>,
+    ledger_registration_id: Option<[u8; 32]>,
+}
+
+impl Session {
+    fn start(&mut self, plan: Plan) -> Result<Transmit, HwiError> {
+        let (prior_inputs, prior_unsigned_tx) = if let bc::Command::SignTx(psbt, _) = &plan.command
+        {
+            (
+                psbt.inputs
+                    .iter()
+                    .map(|input| bhwi::bitcoin::psbt::Input {
+                        partial_sigs: input.partial_sigs.clone(),
+                        tap_key_sig: input.tap_key_sig,
+                        tap_script_sigs: input.tap_script_sigs.clone(),
+                        final_script_sig: input.final_script_sig.clone(),
+                        final_script_witness: input.final_script_witness.clone(),
+                        sighash_type: input.sighash_type,
+                        ..Default::default()
+                    })
+                    .collect(),
+                Some(psbt.unsigned_tx.compute_wtxid()),
+            )
+        } else {
+            (Vec::new(), None)
+        };
+        macro_rules! start {
+            ($interpreter:expr, $command:path) => {{
+                let command = <$command>::try_from(plan.command)
+                    .map_err(|error| map_error(error.into(), self.kind))?;
+                self.started = true;
+                self.expect = plan.expect;
+                self.prior_inputs = prior_inputs;
+                self.prior_unsigned_tx = prior_unsigned_tx;
+                $interpreter.start(Ready(command))
+            }};
+        }
+        let transmit = match &mut self.inner {
+            Inner::BitBox(interpreter) => start!(interpreter, BitBoxCommand),
+            Inner::Coldcard(interpreter) => start!(interpreter, ColdcardCommand),
+            Inner::Jade(interpreter) => start!(interpreter, JadeCommand),
+            Inner::Trezor(interpreter) => start!(interpreter, TrezorCommand),
+            Inner::KeepKey(interpreter) => start!(interpreter, KeepKeyCommand),
+            Inner::Specter(interpreter) => start!(interpreter, SpecterCommand),
+            Inner::Ledger(interpreter) => {
+                let command = LedgerCommand::try_from(plan.command)
+                    .map_err(|error| map_error(error.into(), self.kind))?;
+                let registration_id = match &command {
+                    LedgerCommand::RegisterWallet { policy } => Some(
+                        policy
+                            .id()
+                            .map_err(|_| HwiError::invalid("invalid Ledger wallet policy"))?,
+                    ),
+                    _ => None,
+                };
+                self.started = true;
+                self.expect = plan.expect;
+                self.prior_inputs = prior_inputs;
+                self.prior_unsigned_tx = prior_unsigned_tx;
+                self.ledger_registration_id = registration_id;
+                interpreter.start(Ready(command))
+            }
+        }
+        .map_err(|error| map_error(error, self.kind))?;
+        Ok(transmit.into())
+    }
+
+    fn require_running(&self) -> Result<(), HwiError> {
+        if !self.started {
+            return Err(HwiError::bad_state("command has not started"));
+        }
+        if self.finished {
+            return Err(HwiError::bad_state("command is finished"));
+        }
+        Ok(())
+    }
+
+    fn advance(&mut self, reply: Vec<u8>) -> Result<Option<Transmit>, HwiError> {
+        if matches!(self.kind, DeviceKind::Trezor | DeviceKind::KeepKey)
+            && (reply.len() < 8
+                || &reply[..2] != b"##"
+                || usize::try_from(u32::from_be_bytes(reply[4..8].try_into().unwrap()))
+                    .ok()
+                    .and_then(|len| len.checked_add(8))
+                    != Some(reply.len()))
+        {
+            return Err(HwiError::Device {
+                msg: "malformed device protocol reply".into(),
+            });
+        }
+        if let Some(expected_id) = self.ledger_registration_id {
+            use bhwi::ledger::apdu::StatusWord;
+            // Interrupted-execution requests still belong to core; only final success is bound.
+            if reply.len() >= 2
+                && StatusWord::try_from(u16::from_be_bytes(
+                    reply[reply.len() - 2..].try_into().unwrap(),
+                ))
+                .ok()
+                    == Some(StatusWord::OK)
+                && (reply.len() != 66 || reply[..32] != expected_id)
+            {
+                return Err(HwiError::Device {
+                    msg: "invalid Ledger wallet registration response".into(),
+                });
+            }
+        }
+        match self
+            .inner
+            .exchange(reply)
+            .map_err(|error| map_error(error, self.kind))?
+        {
+            Some(transmit) => Ok(Some(transmit.into())),
+            None => {
+                self.finished = true;
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// Runs one `bhwi::common::Command` as a sequence of payload exchanges.
@@ -103,7 +252,9 @@ impl Interp {
                 started: false,
                 finished: false,
                 expect: Expect::Any,
-                user_action: false,
+                prior_inputs: Vec::new(),
+                prior_unsigned_tx: None,
+                ledger_registration_id: None,
             })),
         })
     }
@@ -123,9 +274,9 @@ impl Interp {
         let out = f(session);
         if let Err(error) = &out {
             // A protocol failure leaves the device mid-command, so the interpreter is
-            // retired (which releases the state lease and frees the handle for a retry).
-            // Misuse (`BadState`) changed nothing, so the session survives it.
-            if !matches!(error, HwiError::BadState { .. }) {
+            // retired, releasing the lease; that is not permission to retry the physical operation.
+            // Misuse and pure preflight changed nothing, so the session survives.
+            if session.started && !matches!(error, HwiError::BadState { .. }) {
                 *guard = None;
             }
         }
@@ -200,23 +351,72 @@ impl Interp {
         )
     }
 
+    #[uniffi::constructor]
+    pub fn new_trezor(
+        network: Network,
+        passphrase: Option<Arc<HostPassphraseHandle>>,
+        on_device_passphrase: bool,
+    ) -> Result<Arc<Self>, HwiError> {
+        if passphrase.is_some() && on_device_passphrase {
+            return Err(HwiError::invalid(
+                "host and on-device passphrases are mutually exclusive",
+            ));
+        }
+        let passphrase = passphrase
+            .as_ref()
+            .map(|handle| handle.clone_passphrase())
+            .transpose()?;
+        Ok(Self::build(
+            Inner::Trezor(
+                TrezorInterpreter::default()
+                    .with_network(network.into())
+                    .with_passphrase(passphrase)
+                    .with_on_device_passphrase(on_device_passphrase),
+            ),
+            DeviceKind::Trezor,
+            StateLease::None,
+        ))
+    }
+
+    #[uniffi::constructor]
+    pub fn new_keepkey(
+        network: Network,
+        passphrase: Option<Arc<HostPassphraseHandle>>,
+    ) -> Result<Arc<Self>, HwiError> {
+        let passphrase = passphrase
+            .as_ref()
+            .map(|handle| handle.clone_passphrase())
+            .transpose()?;
+        Ok(Self::build(
+            Inner::KeepKey(
+                KeepKeyInterpreter::default()
+                    .with_network(network.into())
+                    .with_passphrase(passphrase),
+            ),
+            DeviceKind::KeepKey,
+            StateLease::None,
+        ))
+    }
+
+    /// Specter-DIY. The host supplies complete validated serial response frames.
+    #[uniffi::constructor]
+    pub fn new_specter(network: Network) -> Arc<Self> {
+        Self::build(
+            Inner::Specter(SpecterInterpreter::default().with_network(network.into())),
+            DeviceKind::Specter,
+            StateLease::None,
+        )
+    }
+
     /// Starts the command and returns the first payload to send. Callable once.
     pub fn start(&self, cmd: HwiCommand) -> Result<Transmit, HwiError> {
-        // Input validation happens before the session is touched, so a rejected command
-        // leaves the interpreter usable.
-        let plan = cmd.plan()?;
+        // Validation uses the actual interpreter family, before starting its machine.
         self.with_session(|session| {
             if session.started {
                 return Err(HwiError::bad_state("start was already called"));
             }
-            session.started = true;
-            session.expect = plan.expect;
-            session.user_action = plan.user_action;
-            session
-                .inner
-                .start(plan.command)
-                .map(Transmit::from)
-                .map_err(|e| map_error(e, session.kind, session.user_action))
+            let plan = cmd.plan(session.kind)?;
+            session.start(plan)
         })
     }
 
@@ -224,25 +424,8 @@ impl Interp {
     /// machine is done and [`Interp::end`] should be called.
     pub fn exchange(&self, reply: Vec<u8>) -> Result<Option<Transmit>, HwiError> {
         self.with_session(|session| {
-            if !session.started {
-                return Err(HwiError::bad_state("exchange called before start"));
-            }
-            if session.finished {
-                return Err(HwiError::bad_state(
-                    "exchange called after the machine finished",
-                ));
-            }
-            match session
-                .inner
-                .exchange(reply)
-                .map_err(|e| map_error(e, session.kind, session.user_action))?
-            {
-                Some(transmit) => Ok(Some(transmit.into())),
-                None => {
-                    session.finished = true;
-                    Ok(None)
-                }
-            }
+            session.require_running()?;
+            session.advance(reply)
         })
     }
 
@@ -267,7 +450,8 @@ impl Interp {
             lease,
             kind,
             expect,
-            user_action,
+            prior_inputs,
+            prior_unsigned_tx,
             ..
         } = session;
         // Kept across the lease drop so the Coldcard session key can be installed below.
@@ -293,13 +477,92 @@ impl Interp {
         // The interpreter (and its borrow of the device state) is gone: release the lease
         // before anything touches that state again.
         drop(lease);
-        let response = response.map_err(|e| map_error(e, kind, user_action))?;
+        let response = response.map_err(|e| map_error(e, kind))?;
 
-        // A device that refuses answers the command with an unrelated response (Ledger
-        // turns a `Deny` status word into `TaskDone`), which `bhwi-async` reports as a
-        // missing result. Same check, same mapping.
+        // An unrelated response is a protocol failure, never an inferred refusal.
         if !expect.matches(&response) {
-            return Err(map_error(bc::Error::NoErrorOrResult, kind, user_action));
+            return Err(map_error(bc::Error::NoErrorOrResult, kind));
+        }
+        if let bc::Response::SignedPsbt(psbt) = &response {
+            if prior_unsigned_tx != Some(psbt.unsigned_tx.compute_wtxid())
+                || psbt.inputs.len() != prior_inputs.len()
+            {
+                return Err(HwiError::Device {
+                    msg: "device changed the unsigned transaction".into(),
+                });
+            }
+            for (original, returned) in prior_inputs.iter().zip(&psbt.inputs) {
+                // Fidelity only: the consuming wallet must validate the complete final spend.
+                let final_contains = |signature: &[u8]| {
+                    returned
+                        .final_script_witness
+                        .as_ref()
+                        .is_some_and(|witness| witness.iter().any(|item| item == signature))
+                        || returned.final_script_sig.as_ref().is_some_and(|script| {
+                            script
+                                .instructions()
+                                .try_fold(false, |found, instruction| {
+                                    instruction.map(|instruction| {
+                                        found
+                                            || instruction
+                                                .push_bytes()
+                                                .is_some_and(|push| push.as_bytes() == signature)
+                                    })
+                                })
+                                .unwrap_or(false)
+                        })
+                };
+                let preserved = original.partial_sigs.iter().all(|(key, sig)| {
+                    returned.partial_sigs.get(key).map_or_else(
+                        || final_contains(&sig.serialize()),
+                        |returned| returned == sig,
+                    )
+                }) && original.tap_script_sigs.iter().all(|(key, sig)| {
+                    returned.tap_script_sigs.get(key).map_or_else(
+                        || final_contains(&sig.serialize()),
+                        |returned| returned == sig,
+                    )
+                }) && original.tap_key_sig.is_none_or(|sig| {
+                    returned.tap_key_sig.map_or_else(
+                        || final_contains(&sig.serialize()),
+                        |returned| returned == sig,
+                    )
+                }) && original
+                    .final_script_sig
+                    .as_ref()
+                    .is_none_or(|script| returned.final_script_sig.as_ref() == Some(script))
+                    && original
+                        .final_script_witness
+                        .as_ref()
+                        .is_none_or(|witness| {
+                            returned.final_script_witness.as_ref() == Some(witness)
+                        });
+                if !preserved {
+                    return Err(HwiError::Device {
+                        msg: "device changed or removed an existing PSBT signature".into(),
+                    });
+                }
+                // Check only new signatures against the original request, not returned metadata.
+                let modes_match = returned
+                    .partial_sigs
+                    .iter()
+                    .filter(|(key, _)| !original.partial_sigs.contains_key(*key))
+                    .all(|(_, sig)| original.ecdsa_hash_ty().ok() == Some(sig.sighash_type))
+                    && returned
+                        .tap_script_sigs
+                        .iter()
+                        .filter(|(key, _)| !original.tap_script_sigs.contains_key(*key))
+                        .all(|(_, sig)| original.taproot_hash_ty().ok() == Some(sig.sighash_type))
+                    && (original.tap_key_sig.is_some()
+                        || returned.tap_key_sig.is_none_or(|sig| {
+                            original.taproot_hash_ty().ok() == Some(sig.sighash_type)
+                        }));
+                if !modes_match {
+                    return Err(HwiError::Device {
+                        msg: "device signature does not match the requested sighash".into(),
+                    });
+                }
+            }
         }
 
         Ok(HwiResponse::from(response))
