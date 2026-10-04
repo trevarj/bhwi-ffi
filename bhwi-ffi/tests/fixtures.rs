@@ -1,7 +1,8 @@
 //! Checked-in vectors for host bindings, at both levels of the split.
 //!
 //! * Report level: the real `bhwi-async` Ledger device driven over an in-memory HID
-//!   channel. Hosts reimplement that framing, so they need the exact reports.
+//!   channel. Hosts reimplement that framing, so they need the exact reports. The
+//!   test-only framing also serves the ignored firmware smoke in `policy.rs`;
 //!   `bhwi-async` is a dev-dependency, so no I/O ships in the library.
 //! * Transmit level: the same commands driven through `Interp`, the FFI surface hosts
 //!   call, so a driving loop can be replayed without a device.

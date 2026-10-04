@@ -20,8 +20,8 @@ rand_core = { workspace = true, features = ["getrandom"] }
 thiserror.workspace = true
 uniffi.workspace = true
 
-# Tests only: report fixtures reuse the real bhwi-async HID transports.
-# No async runtime or native I/O ships in the library.
+# Tests only: report fixtures and ignored firmware checks reuse the real
+# `bhwi-async` HID/V1 transports. No async runtime or native I/O ships in the library.
 [dev-dependencies]
 async-trait.workspace = true
 bhwi-async = { workspace = true, features = ["bitbox", "trezor"] }

@@ -107,6 +107,27 @@ derive receive/change addresses (`derive_addresses`) and inspect PSBTs
 (`psbt_summary`). Generated Kotlin names are `buildSinglesigDescriptor`,
 `deriveAddresses` and `psbtSummary`.
 
+The opt-in BitBox chain registers a public policy, checks exact receive/change
+addresses and signs a disposable 2-of-2 PSBT in both signing orders. The Kotlin/JNA
+check reconnects to the same official simulator using a test-only HID TCP adapter
+at `127.0.0.1:15423`; its input is public PSBT data, not an encrypted Noise replay.
+Initialize a **disposable** official simulator with the core E2E harness's fixed
+test mnemonic first; no seed-administration FFI is exposed.
+
+```sh
+BHWI_BITBOX_SIGNING_FIXTURE="$PWD/target/bitbox-signing.json" nix develop -c cargo test --locked -p bhwi-ffi --test policy bitbox_policy_firmware_smoke -- --ignored --nocapture --test-threads=1
+# Regenerate/build the shared bindings first with tools/build-android.sh.
+BHWI_BITBOX_SIGNING_FIXTURE="$PWD/target/bitbox-signing.json" BHWI_BITBOX_SIGNING_RESULT="$PWD/target/bitbox-jvm-signing.json" nix develop -c bash -c 'cd android && bash ./gradlew :lib:testDebugUnitTest --tests com.wizardsardine.bhwi.BitboxSigningFirmwareTest --rerun-tasks'
+BHWI_BITBOX_SIGNING_FIXTURE="$PWD/target/bitbox-jvm-signing.json" nix develop -c cargo test --locked -p bhwi-ffi --test policy bitbox_signing_fixture_verifies -- --ignored --nocapture
+```
+
+Both Rust checks independently verify signatures against the original
+prevouts/scripts/amounts and unchanged unsigned transaction, including exact
+preservation of the foreign signature. The JVM test skips without its input
+variable. TCP/GUI simulator adapters and async dependencies are test-only; synthetic
+replies, prepared commands and simulator runs are not physical-device acceptance.
+Ledger firmware signing additionally requires an available container runtime;
+a synthetic refusal is not successful signing evidence.
 
 ### Trezor and KeepKey authentication
 
@@ -149,6 +170,21 @@ script-path spends are unestablished, not advertised as supported or independent
 verified by this wrapper.
 Cancel, unblock I/O and join before disconnecting/clearing the native handle.
 
+The opt-in Rust and Kotlin/JNA smoke checks require an initialized disposable
+official **Trezor One 1.13.1** emulator, explicit `BHWI_TREZOR_ADDR=127.0.0.1:21324`,
+and its public `BHWI_TREZOR_FINGERPRINT` / `BHWI_TREZOR_ACCOUNT_XPUB` environment.
+For a freshly locked PIN fixture, also set `BHWI_TREZOR_PIN` and explicit
+`BHWI_TREZOR_DEBUG_ADDR=127.0.0.1:21325`; test-only debuglink maps its current keypad.
+Re-lock the fixture before each PIN smoke. Neither smoke initializes or changes a
+seed; passphrase protection must be off. These are firmware, not physical USB proofs.
+The Rust runner enforces a 30-second absolute deadline on every packet send/receive
+within each command and debuglink exchange, not a fresh timeout per packet.
+
+```sh
+nix develop -c cargo test --locked -p bhwi-ffi --test trezor_firmware -- --ignored --test-threads=1
+# Regenerate/build bindings first with tools/build-android.sh.
+nix develop -c bash -c 'cd android && bash ./gradlew :lib:testDebugUnitTest --tests com.wizardsardine.bhwi.TrezorOneFirmwareTest --rerun-tasks'
+```
 
 ### Specter-DIY serial
 
@@ -167,6 +203,32 @@ completion/error is terminal. The monotonic 300-second default deadline includes
 the write. Timeout, cancellation, EOF, write/parser failure retires the link
 permanently; only a complete valid frame allows reuse. The caller still closes I/O.
 
+The opt-in firmware checks use explicit loopback serial/GUI addresses and the
+official simulator's disposable public BIP39 vector. GUI approval and TCP adapters
+are test-only, not USB proof. Start a fresh profile with the existing core
+`nix run .#specter`; do not rerun initialization on a partially initialized profile.
+Use the runner's actual `Running TCP-UART` GUI announcement before initialization.
+The pinned simulator increments occupied ports; readiness must match the owned
+announcement and child PID, not merely find default 8787 open. After initialization
+reaches the final Menu, USB serial is created: read its actual `Running TCP-USB_VCP`
+announcement and confirm that listener belongs to the same owned simulator child
+and source cwd. Do not use USBHost's separate hardcoded `Connect to ...:8789` hint
+as port evidence, or contact/close unrelated listeners.
+The test-owned initializer follows individual screen lines and requires an explicit
+fresh-profile flag. Rust independently derives the account, exact receive/change
+addresses and PSBT signature key; it exports a public account-8 fixture for the
+Kotlin facade and independently verifies the resulting ALL signature and metadata:
+
+```sh
+: "${BHWI_SPECTER_GUI_ADDR:?Set the actual owned runner-reported GUI endpoint before initialization}"
+BHWI_SPECTER_FRESH_PROFILE=1 nix develop -c cargo test --locked -p bhwi-ffi --test specter_firmware specter_fixture_initialize -- --ignored --exact
+: "${BHWI_SPECTER_ADDR:?Set the actual same-child TCP-USB_VCP endpoint announced after initialization}"
+export BHWI_SPECTER_SIGNING_FIXTURE="$PWD/target/specter-signing.json" BHWI_SPECTER_SIGNING_RESULT="$PWD/target/specter-jvm-signing.json"
+nix develop -c cargo test --locked -p bhwi-ffi --test specter_firmware specter_serial_policy_firmware_smoke -- --ignored --exact
+# Regenerate/build shared bindings first with tools/build-android.sh.
+nix develop -c bash -c 'cd android && bash ./gradlew :lib:testDebugUnitTest --tests com.wizardsardine.bhwi.SpecterFirmwareTest --rerun-tasks'
+nix develop -c cargo test --locked -p bhwi-ffi --test specter_firmware specter_signing_fixture_verifies -- --ignored --exact
+```
 
 
 ## Using the bindings

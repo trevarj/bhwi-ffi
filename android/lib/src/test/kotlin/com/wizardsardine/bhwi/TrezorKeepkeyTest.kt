@@ -1,18 +1,24 @@
 package com.wizardsardine.bhwi
 
 import java.io.ByteArrayOutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetSocketAddress
 import java.util.ArrayDeque
 import kotlin.test.assertFailsWith
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import uniffi.bhwi_ffi.HostPassphraseHandle
 import uniffi.bhwi_ffi.HwiCommand
@@ -23,7 +29,7 @@ import uniffi.bhwi_ffi.MultisigAddressFormat
 import uniffi.bhwi_ffi.Network
 import uniffi.bhwi_ffi.WalletPolicy
 
-/** Test-only protobuf field reader for synthetic ACK assertions. */
+/** Test-only protobuf field reader, shared by synthetic ACK assertions and live debuglink. */
 private fun protobufField(body: ByteArray, field: Int): Any? {
     var offset = 0
     fun varint(): Int {
@@ -486,3 +492,75 @@ class TrezorV1FramingTest {
     }
 }
 
+/** Live official firmware only when an explicit test-owned localhost target and public identity are supplied. */
+class TrezorOneFirmwareTest {
+    @Test
+    fun `JNI facade unlocks and identifies the official disposable One fixture with optional ordinary PIN`() = runBlocking<Unit> {
+        val target = System.getenv("BHWI_TREZOR_ADDR")
+        assumeTrue("requires an explicitly selected disposable Trezor One firmware emulator", target != null)
+        val expectedFingerprint = requireNotNull(System.getenv("BHWI_TREZOR_FINGERPRINT"))
+        val expectedXpub = requireNotNull(System.getenv("BHWI_TREZOR_ACCOUNT_XPUB"))
+        withContext(Dispatchers.IO) {
+            udpChannel(requireNotNull(target)).use { channel ->
+                val session = HwiSession.trezorUsb(channel, Network.TESTNET)
+                try {
+                    val info = session.unlock(Network.TESTNET) as HwiResponse.Info
+                    assertEquals("1.13.1", info.version)
+                    assertTrue(info.firmware == null || info.firmware == "1")
+                    assertEquals(true, info.initialized)
+                    assertEquals(false, info.needsPassphraseSent)
+                    assertTrue(session.supportsHostPin(info))
+                    session.configurePassphrase(null, false) // Explicit Standard wallet in this test-owned fixture.
+                    val pin = System.getenv("BHWI_TREZOR_PIN")
+                    if (pin != null) {
+                        check(info.needsPinSent == true) { "the PIN fixture must start locked" }
+                        assertTrue(session.promptPin())
+                        val debugTarget = requireNotNull(System.getenv("BHWI_TREZOR_DEBUG_ADDR"))
+                        udpChannel(debugTarget).use { debug ->
+                            val state = TrezorV1Link(debug).exchange(v1Frame(101), false)
+                            check(state[2] == 0.toByte() && state[3] == 102.toByte())
+                            val matrix = requireNotNull(protobufField(state.copyOfRange(8, state.size), 3) as? ByteArray)
+                                .decodeToString()
+                            check(matrix.length == 9 && matrix.toSet() == ('1'..'9').toSet())
+                            check(pin.isNotEmpty() && pin.all { it in '1'..'9' })
+                            val positions = pin.map { digit -> ('1'.code + matrix.indexOf(digit)).toChar() }.joinToString("")
+                            check(session.sendPin(positions)) { "fixture PIN authentication rejected" }
+                        }
+                    } else {
+                        assertEquals(false, info.needsPinSent)
+                    }
+                    assertEquals(expectedFingerprint, session.getMasterFingerprint())
+                    assertEquals(expectedXpub, session.getExtendedPubkey("m/84'/1'/0'", false))
+                } finally { session.disconnect() }
+            }
+        }
+    }
+
+    private class UdpChannel(private val socket: DatagramSocket) : HidChannel, AutoCloseable {
+        override suspend fun send(report: ByteArray): UInt {
+            check(report.size == 64)
+            socket.send(DatagramPacket(report, report.size))
+            return report.size.toUInt()
+        }
+        override suspend fun receive(maxLen: UInt): ByteArray {
+            check(maxLen == 64u)
+            val packet = DatagramPacket(ByteArray(65), 65)
+            socket.receive(packet)
+            check(packet.length == 64) { "invalid emulator datagram length" }
+            return packet.data.copyOf(packet.length)
+        }
+        override fun close() = socket.close()
+    }
+
+    private fun udpChannel(target: String): UdpChannel {
+        val parts = target.split(':')
+        require(parts.size == 2 && parts[0] == "127.0.0.1") { "only explicit localhost emulator targets are allowed" }
+        val port = parts[1].toInt()
+        require(port in 1..65535)
+        return UdpChannel(DatagramSocket(InetSocketAddress("127.0.0.1", 0)).apply {
+            soTimeout = 10_000
+            connect(InetSocketAddress("127.0.0.1", port))
+        })
+    }
+
+}

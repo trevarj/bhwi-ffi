@@ -1,5 +1,5 @@
 //! Public-input and protocol regressions through the real FFI/core interpreters.
-//! Scripted replies are synthetic protocol responses.
+//! Scripted replies are synthetic protocol responses. The ignored firmware module uses live firmware.
 
 use std::str::FromStr;
 
@@ -18,7 +18,7 @@ use bhwi::ledger::{LedgerWalletPolicy, Version};
 use bhwi::miniscript::descriptor::WalletPolicy as CoreWalletPolicy;
 use bhwi_ffi::{
     ColdcardEncryption, HwiCommand, HwiError, HwiResponse, Interp, MultisigAddressFormat, Network,
-    NoiseHandle, WalletPolicy, WalletRegistration,
+    NoiseHandle, Recipient, WalletPolicy, WalletRegistration,
 };
 
 const XPUB: &str = "tpubDCbK3Ysvk8HjcF6mPyrgMu3KgLiaaP19RjKpNezd8GrbAbNg6v5BtWLaCt8FNm6QkLseopKLf5MNYQFtochDTKHdfgG6iqJ8cqnLNAwtXuP";
@@ -1148,6 +1148,343 @@ fn jade_accepts_signature_preserving_final_and_mixed_inputs_but_not_missing_or_c
                 }
             }
         }
+    }
+}
+
+// Fixture-only TCP transport: reuses the core E2E HID/HWW framing, never ships in the library.
+mod firmware {
+    use super::*;
+    use async_trait::async_trait;
+    use bhwi::bitcoin::bip32::Fingerprint;
+    use bhwi::miniscript::descriptor::DescriptorPublicKey;
+    use bhwi::miniscript::psbt::{PsbtInputExt, PsbtOutputExt};
+    use bhwi_async::Transport;
+    use bhwi_async::transport::Channel;
+    use bhwi_async::transport::bitbox::hid::BitBoxTransportHID;
+    use futures::executor::block_on;
+    use std::cell::RefCell;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct TcpChannel(RefCell<TcpStream>);
+
+    #[async_trait(?Send)]
+    impl Channel for TcpChannel {
+        async fn send(&self, data: &[u8]) -> Result<usize, std::io::Error> {
+            let mut stream = self.0.borrow_mut();
+            stream.write_all(data)?;
+            stream.flush()?;
+            Ok(data.len())
+        }
+        async fn receive(&mut self, data: &mut [u8]) -> Result<usize, std::io::Error> {
+            self.0.borrow_mut().read_exact(data)?;
+            Ok(data.len())
+        }
+    }
+
+    fn run(
+        noise: &Arc<NoiseHandle>,
+        transport: &mut BitBoxTransportHID<TcpChannel>,
+        cmd: HwiCommand,
+    ) -> HwiResponse {
+        let label = match &cmd {
+            HwiCommand::RegisterWallet { .. } => "register-wallet",
+            HwiCommand::SignPsbt { .. } => "sign-psbt",
+            _ => "policy-command",
+        };
+        let mut exchanges = 0;
+        let interp = Interp::new_bitbox(noise.clone(), Network::Bitcoin).unwrap();
+        let mut next = Some(
+            interp
+                .start(cmd)
+                .unwrap_or_else(|error| panic!("{label} start: {error}")),
+        );
+        while let Some(transmit) = next {
+            assert_eq!(transmit.recipient, Recipient::Device);
+            let reply =
+                block_on(transport.exchange(&transmit.payload, transmit.encrypted)).unwrap();
+            exchanges += 1;
+            next = interp
+                .exchange(reply)
+                .unwrap_or_else(|error| panic!("{label} exchange {exchanges}: {error}"));
+            if let Some(code) = noise.take_pairing_code() {
+                assert!(!code.is_empty()); // Test simulator auto-approval is not production approval.
+            }
+        }
+        interp
+            .end()
+            .unwrap_or_else(|error| panic!("{label} completion: {error}"))
+    }
+
+    #[test]
+    #[ignore = "requires the initialized official BitBox02 firmware simulator on 127.0.0.1:15423"]
+    fn bitbox_policy_firmware_smoke() {
+        const ROOT: &str = "xprv9s21ZrQH143K2qxpAMxVdyeza5dUBxY11XbJ7eKvRF51sQyhiFXgmn4P4ALi3Nf6bcG8cmPDvMMEFiAVjtXsqeZ47PJfBJif7uSYycMsx9c";
+        let stream =
+            TcpStream::connect_timeout(&"127.0.0.1:15423".parse().unwrap(), Duration::from_secs(5))
+                .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(300)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut transport = BitBoxTransportHID::new(TcpChannel(RefCell::new(stream)));
+        let noise = NoiseHandle::new(None).unwrap();
+        run(
+            &noise,
+            &mut transport,
+            HwiCommand::Unlock {
+                network: Network::Bitcoin,
+            },
+        );
+        let HwiResponse::Fingerprint { hex: fingerprint } =
+            run(&noise, &mut transport, HwiCommand::GetMasterFingerprint)
+        else {
+            panic!("fingerprint");
+        };
+        let secp = Secp256k1::new();
+        let root = Xpriv::from_str(ROOT).unwrap();
+        assert_eq!(
+            fingerprint,
+            root.fingerprint(&secp).to_string(),
+            "initialize the simulator with the core E2E harness first"
+        );
+        let account = DerivationPath::from_str("m/48'/0'/0'/2'").unwrap();
+        let HwiResponse::Xpub { xpub } = run(
+            &noise,
+            &mut transport,
+            HwiCommand::GetXpub {
+                path: "m/48'/0'/0'/2'".into(),
+                display: false,
+            },
+        ) else {
+            panic!("xpub");
+        };
+        assert_eq!(
+            xpub,
+            Xpub::from_priv(&secp, &root.derive_priv(&secp, &account).unwrap()).to_string()
+        );
+        let foreign = Xpriv::new_master(bhwi::bitcoin::Network::Bitcoin, &[42; 32]).unwrap();
+        let foreign_fp = foreign.fingerprint(&secp);
+        let foreign_xpub = Xpub::from_priv(&secp, &foreign.derive_priv(&secp, &account).unwrap());
+        let descriptor = format!(
+            "wsh(andor(pk([{fingerprint}/48'/0'/0'/2']{xpub}/<0;1>/*),older(12960),pk([{foreign_fp}/48'/0'/0'/2']{foreign_xpub}/<0;1>/*)))"
+        );
+        let name = "bhwi-ffi-policy";
+        assert!(matches!(
+            run(
+                &noise,
+                &mut transport,
+                HwiCommand::RegisterWallet {
+                    name: name.into(),
+                    descriptor: descriptor.clone()
+                }
+            ),
+            HwiResponse::WalletRegistration {
+                registration: WalletRegistration::Complete { hmac: None }
+            }
+        ));
+        for (change, index) in [(false, 0), (true, 7)] {
+            let expected =
+                bhwi_ffi::derive_addresses(descriptor.clone(), Network::Bitcoin, change, index, 1)
+                    .unwrap()
+                    .remove(0)
+                    .address;
+            let HwiResponse::Address { address } = run(
+                &noise,
+                &mut transport,
+                HwiCommand::DisplayDescriptorAddress {
+                    index,
+                    change,
+                    display: true,
+                    wallet_policy: WalletPolicy {
+                        name: name.into(),
+                        descriptor: descriptor.clone(),
+                        ledger_hmac: None,
+                    },
+                },
+            ) else {
+                panic!("address");
+            };
+            assert_eq!(address, expected);
+            eprintln!("BitBox02 registered-policy address ({change}, {index}): {address}");
+        }
+
+        // A separate conventional 2-of-2 policy signs disposable constructed prevouts.
+        let descriptor = format!(
+            "wsh(sortedmulti(2,[{fingerprint}/48'/0'/0'/2']{xpub}/<0;1>/*,[{foreign_fp}/48'/0'/0'/2']{foreign_xpub}/<0;1>/*))"
+        );
+        let name = "bhwi-ffi-signing";
+        assert!(matches!(
+            run(
+                &noise,
+                &mut transport,
+                HwiCommand::RegisterWallet {
+                    name: name.into(),
+                    descriptor: descriptor.clone(),
+                }
+            ),
+            HwiResponse::WalletRegistration {
+                registration: WalletRegistration::Complete { hmac: None }
+            }
+        ));
+        let child = DerivationPath::from_str("m/48'/0'/0'/2'/0/0").unwrap();
+        let device = PublicKey::new(
+            root.derive_priv(&secp, &child)
+                .unwrap()
+                .private_key
+                .public_key(&secp),
+        );
+        let foreign_secret = foreign.derive_priv(&secp, &child).unwrap().private_key;
+        let foreign_public = PublicKey::new(foreign_secret.public_key(&secp));
+        let mut unsigned = funded_psbt(multisig_script(device, foreign_public));
+        // Match the committed core E2E builder: descriptor-derived receive/change
+        // metadata, a constructed previous transaction and an RBF-enabled spend.
+        let descriptor_public =
+            bhwi::miniscript::Descriptor::<DescriptorPublicKey>::from_str(&descriptor).unwrap();
+        let mut branches = descriptor_public
+            .into_single_descriptors()
+            .unwrap()
+            .into_iter();
+        let receive = branches.next().unwrap().derive_at_index(0).unwrap();
+        let change = branches.next().unwrap().derive_at_index(0).unwrap();
+        let receive_script = receive.derived_descriptor(&secp).script_pubkey();
+        assert_eq!(
+            unsigned.inputs[0]
+                .witness_utxo
+                .as_ref()
+                .unwrap()
+                .script_pubkey,
+            receive_script
+        );
+        let parent = unsigned.inputs[0].non_witness_utxo.as_mut().unwrap();
+        parent.input[0].previous_output = OutPoint::null();
+        unsigned.unsigned_tx.input[0].previous_output.txid = parent.compute_txid();
+        unsigned.unsigned_tx.input[0].sequence = bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME;
+        unsigned.unsigned_tx.output[0].script_pubkey =
+            change.derived_descriptor(&secp).script_pubkey();
+        unsigned.inputs[0]
+            .update_with_descriptor_unchecked(&receive)
+            .unwrap();
+        unsigned.outputs[0]
+            .update_with_descriptor_unchecked(&change)
+            .unwrap();
+        unsigned.xpub.insert(
+            Xpub::from_str(&xpub).unwrap(),
+            (
+                Fingerprint::from_str(&fingerprint).unwrap(),
+                account.clone(),
+            ),
+        );
+        unsigned.xpub.insert(foreign_xpub, (foreign_fp, account));
+        let wallet_policy = WalletPolicy {
+            name: name.into(),
+            descriptor: descriptor.clone(),
+            ledger_hmac: None,
+        };
+        for foreign_first in [true, false] {
+            let mut original = unsigned.clone();
+            if foreign_first {
+                add_test_cosignature(&mut original, &foreign_secret);
+            }
+            let HwiResponse::SignedPsbt { psbt_base64 } = run(
+                &noise,
+                &mut transport,
+                sign_command(&original, Some(wallet_policy.clone())),
+            ) else {
+                panic!("expected full signed PSBT");
+            };
+            let mut returned =
+                Psbt::deserialize(&Base64::decode_vec(&psbt_base64).unwrap()).unwrap();
+            assert_eq!(returned.unsigned_tx, original.unsigned_tx);
+            assert_eq!(
+                returned.inputs[0].witness_utxo,
+                original.inputs[0].witness_utxo
+            );
+            assert_eq!(
+                returned.inputs[0].witness_script,
+                original.inputs[0].witness_script
+            );
+            assert_signature(&returned, device);
+            if foreign_first {
+                assert_eq!(
+                    returned.inputs[0].partial_sigs[&foreign_public],
+                    original.inputs[0].partial_sigs[&foreign_public]
+                );
+                assert_signature(&returned, foreign_public);
+                if let Some(path) = std::env::var_os("BHWI_BITBOX_SIGNING_FIXTURE") {
+                    let fixture = serde_json::json!({
+                        "source": "live official BitBox02 firmware; public PSBT fixture, not a Noise replay",
+                        "name": name,
+                        "descriptor": descriptor,
+                        "original_psbt": Base64::encode_string(&original.serialize()),
+                        "signed_psbt": psbt_base64,
+                        "device_pubkey": device.to_string(),
+                        "foreign_pubkey": foreign_public.to_string(),
+                        "fingerprint": fingerprint,
+                        "account_xpub": xpub,
+                    });
+                    std::fs::write(path, serde_json::to_string_pretty(&fixture).unwrap()).unwrap();
+                }
+            } else {
+                let device_signature = returned.inputs[0].partial_sigs[&device];
+                add_test_cosignature(&mut returned, &foreign_secret);
+                assert_eq!(returned.inputs[0].partial_sigs[&device], device_signature);
+                assert_signature(&returned, device);
+                assert_signature(&returned, foreign_public);
+            }
+            eprintln!("BitBox02 full-PSBT signing verified (foreign first: {foreign_first})");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires BHWI_BITBOX_SIGNING_FIXTURE containing a live Rust/JVM smoke result"]
+    fn bitbox_signing_fixture_verifies() {
+        let path = std::env::var_os("BHWI_BITBOX_SIGNING_FIXTURE").expect("fixture path");
+        let fixture: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let parse = |field: &str| {
+            Psbt::deserialize(&Base64::decode_vec(fixture[field].as_str().unwrap()).unwrap())
+                .unwrap()
+        };
+        let original = parse("original_psbt");
+        let signed = parse("signed_psbt");
+        let foreign = PublicKey::from_str(fixture["foreign_pubkey"].as_str().unwrap()).unwrap();
+        let device = PublicKey::from_str(fixture["device_pubkey"].as_str().unwrap()).unwrap();
+        let witness_script = multisig_script(device, foreign);
+        assert_eq!(
+            original.inputs[0].witness_script.as_ref(),
+            Some(&witness_script)
+        );
+        let parent = original.inputs[0].non_witness_utxo.as_ref().unwrap();
+        let outpoint = original.unsigned_tx.input[0].previous_output;
+        assert_eq!(parent.compute_txid(), outpoint.txid);
+        let funding = &parent.output[outpoint.vout as usize];
+        assert_eq!(funding.script_pubkey, witness_script.to_p2wsh());
+        assert_eq!(original.inputs[0].witness_utxo.as_ref(), Some(funding));
+        assert_eq!(signed.unsigned_tx, original.unsigned_tx);
+        assert_eq!(
+            signed.inputs[0].non_witness_utxo,
+            original.inputs[0].non_witness_utxo
+        );
+        assert_eq!(
+            signed.inputs[0].witness_utxo,
+            original.inputs[0].witness_utxo
+        );
+        assert_eq!(
+            signed.inputs[0].witness_script,
+            original.inputs[0].witness_script
+        );
+        assert_eq!(
+            signed.inputs[0].partial_sigs[&foreign],
+            original.inputs[0].partial_sigs[&foreign]
+        );
+        assert!(!original.inputs[0].partial_sigs.contains_key(&device));
+        assert_signature(&signed, foreign);
+        assert_signature(&signed, device);
     }
 }
 
