@@ -159,7 +159,10 @@ AlreadyUnlocked returns TaskDone only at that unlock boundary.
 A locked T may still report `needs_pin_sent=true`: do not show it a host keypad.
 One/KeepKey use `promptPin()` then `sendPin(positions)` over the **same physical
 connection**, without intervening Initialize/unlock. Positions are digits 1–9 on
-a blank keypad, not the literal PIN. False means authentication rejection.
+a blank keypad, not the literal PIN. A rejected PIN (typed Trezor/KeepKey code 7)
+throws `AuthRefused`, as do authentication cancellation codes 4/6; rejection is
+not a successful `false` result. Trezor may first request Features before reporting
+the rejection. A runtime error retires that command's interpreter.
 PIN commands do not overwrite the chosen future passphrase mode; ordinary unlock
 uses no recovery host events, seed-administration API or FFI-owned dialogs.
 Registration and descriptor address display are explicitly unsupported for these
@@ -264,19 +267,31 @@ exchange retire the command state, so later calls fail with `BadState`. Runtime
 errors are not reusable preflight merely because they report `InvalidInput`.
 
 Rust's structured `HwiError` distinguishes `Device`, `UserRefused`, `AuthRefused`,
-`DeviceAlreadyUnlocked`, `InvalidInput`, `BadState` and `Internal`. Core
-`UserCancelled` maps directly to `UserRefused`, without parsing device strings or
-inferring refusal from missing results. `HwiSession.unlock` alone treats typed
-`DeviceAlreadyUnlocked` as benign; other commands propagate it. These become Kotlin
-`HwiException` variants. Transport and HTTP failures belong to the host.
+`DeviceAlreadyUnlocked`, `InvalidInput`, `BadState` and `Internal`. Mapping uses
+core `ErrorKind`, `DeviceCode` and retained native Specter error variants, never
+device message text. Ordinary
+`UserCancelled` maps to `UserRefused`; typed Trezor/KeepKey cancellation codes 4/6
+and wrong-PIN code 7 map to `AuthRefused`. Missing host context and invalid or
+unsupported command input remain `InvalidInput`. Device-coded invalid-input,
+unsupported-operation and network errors remain `Device`, with safe numeric codes;
+unknown or ambiguous failures also remain `Device`. Specter malformed payloads and
+Trezor/KeepKey/Specter wrong-network responses retain `InvalidInput`, while Specter
+framing/state failures remain `Device`. The FFI retains `SpecterError` until this
+boundary because upstream's common adapter classifies both malformed payloads and
+framing as serialization errors. No missing result implies refusal.
+`HwiSession.unlock` alone treats typed `DeviceAlreadyUnlocked` as benign; other
+commands propagate it. These become Kotlin `HwiException` variants. Transport and
+HTTP failures belong to the host.
 
 `HwiResponse.Info` preserves the device's `version`, `firmware` (which can be a
 model identifier), `initialized`, `networks`, `label`,
 `on_device_passphrase_entry`, `needs_pin_sent` and `needs_passphrase_sent`, including
-unknown (`None`) values.
+unknown (`None`) values. Jade reports `initialized` from its firmware state
+(`Uninit` is false; other states are true).
 
-Messages in these structured `HwiError` values do not carry raw protocol payloads
-or key material. This guarantee does **not** cover unexpected failures: UniFFI
+Messages in these structured `HwiError` values do not export upstream error
+messages, data, raw protocol payloads or key material. This guarantee does **not**
+cover unexpected failures: UniFFI
 catches unwinding panics and reports them separately as Kotlin `InternalException`,
 which can preserve panic text. Aborts and out-of-memory failures are not made
 recoverable by that boundary.
@@ -672,25 +687,20 @@ script checks boot completion and property/package readiness before running the
 test. Inspect `target/emulator.log` on boot failure; a successful APK build or JVM
 gate is not evidence that instrumentation ran.
 
-### Local BHWI checkout
+### BHWI dependency revision
 
-For a sibling core checkout, add this local override to the workspace `Cargo.toml`;
-its patch URL must match the pinned dependency URL:
+Both `bhwi` and `bhwi-async` are pinned to immutable upstream revision
+[`580350d258651d5329b8ef5fa1dfa9aa42a8ccb9`](https://github.com/wizardsardine/bhwi/commit/580350d258651d5329b8ef5fa1dfa9aa42a8ccb9)
+in `Cargo.toml` and `Cargo.lock`. This revision includes native thread-safe BitBox
+pairing and sorted-multisig registration, address display and signing. No sibling
+checkout or local Cargo patch is required.
 
-```toml
-[patch."https://github.com/trevarj/bhwi"]
-bhwi = { path = "../bhwi/bhwi" }
-bhwi-async = { path = "../bhwi/bhwi-async" }
-```
-
-Using that override requires intentionally updating the local lockfile before
-locked builds, for example:
+After intentionally changing both manifest revisions, resolve their new sources
+through the consuming crate; unchanged transitive packages remain locked:
 
 ```sh
-nix develop -c cargo update -p bhwi -p bhwi-async
+nix develop -c cargo update -p bhwi-ffi
 ```
-
-Do not commit the local override or the resulting local lockfile changes.
 
 ## Documentation
 

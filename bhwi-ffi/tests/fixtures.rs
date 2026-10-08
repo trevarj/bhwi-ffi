@@ -211,8 +211,9 @@ fn ledger_refused() {
     // The core preserves physical cancellation as a typed error.
     assert!(
         matches!(
-            error,
-            bhwi_async::Error::Interpreter(bhwi::common::Error::UserCancelled)
+            &error,
+            bhwi_async::Error::Interpreter(error)
+                if error.kind() == bhwi::common::ErrorKind::UserCancelled
         ),
         "expected typed cancellation, got {error:?}"
     );

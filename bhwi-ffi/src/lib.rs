@@ -94,6 +94,9 @@ impl From<AddressFormat> for bhwi::bitcoin::AddressType {
 
 /// Structured errors surfaced to foreign-language hosts. Messages produced by this
 /// crate do not carry raw protocol payloads or key material.
+/// Upstream error messages/data are discarded; native variants, kinds and vendor codes determine
+/// categories. Trezor/KeepKey authentication cancellation codes 4/6 and wrong-PIN
+/// code 7 are `AuthRefused`, not successful `DeviceAction(false)` responses.
 ///
 /// This guarantee applies only to `HwiError`. UniFFI catches unwinding panics and
 /// reports unexpected failures separately (as Kotlin `InternalException`), whose

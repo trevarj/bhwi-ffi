@@ -496,43 +496,84 @@ pub(crate) enum DeviceKind {
     Specter,
 }
 
-/// Maps typed interpreter errors to the FFI surface without inspecting device messages.
+/// Maps typed interpreter errors without exporting their messages or data.
 pub(crate) fn map_error(error: bc::Error, kind: DeviceKind) -> HwiError {
-    match error {
-        bc::Error::AuthenticationRefused => HwiError::AuthRefused,
-        bc::Error::UserCancelled => HwiError::UserRefused,
-        bc::Error::DeviceAlreadyUnlocked(_) => HwiError::DeviceAlreadyUnlocked,
-        // The command is missing data this API does not carry (a Ledger wallet policy).
-        bc::Error::MissingCommandInfo(context) => HwiError::InvalidInput {
-            msg: context.to_owned(),
-        },
-        bc::Error::InvalidInput(_) => HwiError::InvalidInput {
-            msg: format!("{kind:?}: invalid command input"),
-        },
-        bc::Error::Device(_) => HwiError::Device {
-            msg: format!("{kind:?}: device reported an error"),
-        },
-        bc::Error::UnexpectedResult(_, _) => HwiError::Device {
-            msg: format!("{kind:?}: unexpected response"),
-        },
-        bc::Error::Rpc(code, _) => HwiError::Device {
-            msg: format!("{kind:?}: rpc error {code}"),
-        },
-        bc::Error::Serialization(_) => HwiError::Device {
-            msg: format!("{kind:?}: protocol serialization failed"),
-        },
-        bc::Error::UnsupportedDisplayAddress(_) => HwiError::Device {
-            msg: format!("{kind:?}: unsupported address display"),
-        },
-        bc::Error::Encryption(context) => HwiError::Device {
-            msg: format!("encryption error: {context}"),
-        },
-        bc::Error::Request(context) => HwiError::Device {
-            msg: format!("request error: {context}"),
-        },
-        bc::Error::NoErrorOrResult => HwiError::Device {
-            msg: "no error or result returned".to_owned(),
-        },
+    use bc::{DeviceCode, ErrorKind};
+
+    match (error.kind(), error.device_code()) {
+        (ErrorKind::AuthenticationRefused, _) => return HwiError::AuthRefused,
+        (
+            ErrorKind::UserCancelled,
+            Some(DeviceCode::Trezor(4 | 6) | DeviceCode::KeepKey(4 | 6)),
+        )
+        | (ErrorKind::WrongPin, Some(DeviceCode::Trezor(7) | DeviceCode::KeepKey(7))) => {
+            return HwiError::AuthRefused;
+        }
+        (ErrorKind::UserCancelled, _) => return HwiError::UserRefused,
+        (ErrorKind::AlreadyUnlocked, _) => return HwiError::DeviceAlreadyUnlocked,
+        // Device-reported input/network errors remain Device, not host InvalidInput.
+        (
+            _,
+            Some(DeviceCode::Jade(code) | DeviceCode::Trezor(code) | DeviceCode::KeepKey(code)),
+        ) => {
+            return HwiError::Device {
+                msg: format!("{kind:?}: rpc error {code}"),
+            };
+        }
+        (_, Some(DeviceCode::Ledger(code))) => {
+            return HwiError::Device {
+                msg: format!("{kind:?}: device status {code:#06x}"),
+            };
+        }
+        (_, Some(DeviceCode::BitBox(code))) => {
+            return HwiError::Device {
+                msg: format!("{kind:?}: device error {code}"),
+            };
+        }
+        (_, Some(_)) => {
+            return HwiError::Device {
+                msg: format!("{kind:?}: device reported an error"),
+            };
+        }
+        _ => {}
+    }
+
+    let category = error.kind();
+    if matches!(
+        category,
+        ErrorKind::InvalidInput | ErrorKind::MissingContext
+    ) || (category == ErrorKind::Unsupported && kind != DeviceKind::BitBox)
+        || (category == ErrorKind::WrongNetwork
+            && matches!(
+                kind,
+                DeviceKind::Trezor | DeviceKind::KeepKey | DeviceKind::Specter
+            ))
+    {
+        return HwiError::InvalidInput {
+            msg: format!("{kind:?}: invalid or unsupported command input"),
+        };
+    }
+    HwiError::Device {
+        msg: format!(
+            "{kind:?}: {}",
+            match category {
+                ErrorKind::UnexpectedResponse => "unexpected response",
+                ErrorKind::Serialization => "protocol serialization failed",
+                ErrorKind::UnsupportedDisplayAddress => "unsupported address display",
+                ErrorKind::Encryption => "channel encryption failed",
+                ErrorKind::Transport | ErrorKind::Disconnected => "communication failed",
+                _ => "device reported an error",
+            }
+        ),
+    }
+}
+
+/// Command conversion proves host provenance, unlike BitBox firmware-version errors.
+pub(crate) fn map_command_error(error: bc::Error, kind: DeviceKind) -> HwiError {
+    if error.kind() == bc::ErrorKind::Unsupported && error.device_code().is_none() {
+        HwiError::invalid(format!("{kind:?}: unsupported command input"))
+    } else {
+        map_error(error, kind)
     }
 }
 
@@ -833,6 +874,7 @@ mod tests {
 
     #[test]
     fn refusal_mapping_uses_only_typed_errors() {
+        use bc::{DeviceCode, ErrorKind};
         for kind in [
             DeviceKind::Ledger,
             DeviceKind::Coldcard,
@@ -843,55 +885,180 @@ mod tests {
             DeviceKind::Specter,
         ] {
             assert!(matches!(
-                map_error(bc::Error::UserCancelled, kind),
+                map_error(bc::Error::new(ErrorKind::UserCancelled, ""), kind),
                 HwiError::UserRefused
             ));
             assert!(matches!(
-                map_error(bc::Error::AuthenticationRefused, kind),
+                map_error(bc::Error::new(ErrorKind::AuthenticationRefused, ""), kind),
                 HwiError::AuthRefused
             ));
-            for source in [
-                bc::Error::NoErrorOrResult,
-                bc::Error::Rpc(-32000, None),
-                bc::Error::UnexpectedResult(Vec::new(), "got Refu".into()),
+            for category in [
+                ErrorKind::Other,
+                ErrorKind::UnexpectedResponse,
+                ErrorKind::WrongPin,
             ] {
-                assert!(matches!(map_error(source, kind), HwiError::Device { .. }));
+                assert!(matches!(
+                    map_error(bc::Error::new(category, "User cancelled: bad pin"), kind),
+                    HwiError::Device { .. }
+                ));
             }
+        }
+        for (kind, code) in [
+            (
+                DeviceKind::Trezor,
+                DeviceCode::Trezor as fn(i32) -> DeviceCode,
+            ),
+            (
+                DeviceKind::KeepKey,
+                DeviceCode::KeepKey as fn(i32) -> DeviceCode,
+            ),
+        ] {
+            for (category, number) in [
+                (ErrorKind::UserCancelled, 4),
+                (ErrorKind::UserCancelled, 6),
+                (ErrorKind::WrongPin, 7),
+            ] {
+                assert!(matches!(
+                    map_error(
+                        bc::Error::new(category, "").with_device_code(code(number)),
+                        kind
+                    ),
+                    HwiError::AuthRefused
+                ));
+            }
+            assert!(matches!(
+                map_error(
+                    bc::Error::new(ErrorKind::Other, "PIN cancelled").with_device_code(code(7)),
+                    kind
+                ),
+                HwiError::Device { .. }
+            ));
         }
     }
 
     #[test]
-    fn errors_never_leak_untrusted_strings() {
-        let canary = "ffi-redaction-canary";
-        for source in [
-            bc::Error::Device(canary.into()),
-            bc::Error::Serialization(canary.into()),
-            bc::Error::InvalidInput(canary.into()),
-            bc::Error::UnsupportedDisplayAddress(canary.into()),
-            bc::Error::Rpc(-32602, Some(canary.into())),
-            bc::Error::UnexpectedResult(canary.as_bytes().to_vec(), canary.into()),
+    fn device_codes_preserve_input_provenance() {
+        use bc::{DeviceCode, ErrorKind};
+        for (kind, code, category) in [
+            (
+                DeviceKind::Jade,
+                DeviceCode::Jade(-32602),
+                ErrorKind::InvalidInput,
+            ),
+            (
+                DeviceKind::Jade,
+                DeviceCode::Jade(-32003),
+                ErrorKind::WrongNetwork,
+            ),
+            (
+                DeviceKind::Ledger,
+                DeviceCode::Ledger(0x6a80),
+                ErrorKind::InvalidInput,
+            ),
+            (
+                DeviceKind::Ledger,
+                DeviceCode::Ledger(0x6d00),
+                ErrorKind::Unsupported,
+            ),
+            (
+                DeviceKind::BitBox,
+                DeviceCode::BitBox(101),
+                ErrorKind::InvalidInput,
+            ),
+            (
+                DeviceKind::BitBox,
+                DeviceCode::BitBox(106),
+                ErrorKind::Unsupported,
+            ),
         ] {
-            let invalid_input = matches!(&source, bc::Error::InvalidInput(_));
-            let rpc = matches!(&source, bc::Error::Rpc(..));
-            let error = map_error(source, DeviceKind::Coldcard);
-            let msg = match &error {
-                HwiError::InvalidInput { msg } if invalid_input => msg,
-                HwiError::Device { msg } if !invalid_input => msg,
-                _ => panic!("unexpected error category: {error:?}"),
-            };
-            assert!(!msg.contains(canary), "leaked error field: {error:?}");
-            assert!(!error.to_string().contains(canary));
-            if rpc {
-                assert!(msg.contains("-32602"), "RPC code was discarded");
+            assert!(matches!(
+                map_error(bc::Error::new(category, "").with_device_code(code), kind),
+                HwiError::Device { .. }
+            ));
+        }
+        for kind in [DeviceKind::Trezor, DeviceKind::KeepKey, DeviceKind::Specter] {
+            assert!(matches!(
+                map_error(bc::Error::new(ErrorKind::WrongNetwork, ""), kind),
+                HwiError::InvalidInput { .. }
+            ));
+        }
+        assert!(matches!(
+            map_error(
+                bhwi::bitbox::error::BitBoxError::Version("9.9.9").into(),
+                DeviceKind::BitBox
+            ),
+            HwiError::Device { .. }
+        ));
+        assert!(matches!(
+            map_command_error(
+                bhwi::bitbox::error::BitBoxError::Unsupported("host PIN").into(),
+                DeviceKind::BitBox
+            ),
+            HwiError::InvalidInput { .. }
+        ));
+    }
+
+    #[test]
+    fn errors_never_leak_untrusted_strings_or_data() {
+        use bc::{DeviceCode, ErrorKind};
+        let canary = "ffi-redaction-canary";
+        for category in [
+            ErrorKind::UserCancelled,
+            ErrorKind::AuthenticationRefused,
+            ErrorKind::HostUnavailable,
+            ErrorKind::Locked,
+            ErrorKind::NotReady,
+            ErrorKind::AlreadyUnlocked,
+            ErrorKind::NotInitialized,
+            ErrorKind::AlreadyInitialized,
+            ErrorKind::WrongPin,
+            ErrorKind::WrongNetwork,
+            ErrorKind::Duplicate,
+            ErrorKind::Unsupported,
+            ErrorKind::UnsupportedDisplayAddress,
+            ErrorKind::MissingContext,
+            ErrorKind::InvalidInput,
+            ErrorKind::Rejected,
+            ErrorKind::DeviceFailure,
+            ErrorKind::Protocol,
+            ErrorKind::UnexpectedResponse,
+            ErrorKind::Serialization,
+            ErrorKind::Encryption,
+            ErrorKind::Transport,
+            ErrorKind::Disconnected,
+            ErrorKind::Other,
+        ] {
+            for code in [
+                None,
+                Some(DeviceCode::Jade(-32602)),
+                Some(DeviceCode::Trezor(7)),
+                Some(DeviceCode::KeepKey(7)),
+                Some(DeviceCode::Ledger(0x6a80)),
+                Some(DeviceCode::BitBox(101)),
+            ] {
+                let mut source =
+                    bc::Error::new(category, canary).with_data(canary.as_bytes().to_vec());
+                if let Some(code) = code {
+                    source = source.with_device_code(code);
+                }
+                let error = map_error(source, DeviceKind::Coldcard);
+                assert!(!error.to_string().contains(canary));
+                assert!(!format!("{error:?}").contains(canary));
+                if category == ErrorKind::InvalidInput && code.is_none() {
+                    assert!(matches!(error, HwiError::InvalidInput { .. }));
+                }
+                if code == Some(DeviceCode::Jade(-32602))
+                    && !matches!(
+                        category,
+                        ErrorKind::UserCancelled
+                            | ErrorKind::AuthenticationRefused
+                            | ErrorKind::AlreadyUnlocked
+                    )
+                {
+                    assert!(matches!(error, HwiError::Device { msg } if msg.contains("-32602")));
+                }
             }
         }
-        let error = map_error(
-            bc::Error::DeviceAlreadyUnlocked("ffi-redaction-canary"),
-            DeviceKind::Ledger,
-        );
-        assert!(matches!(error, HwiError::DeviceAlreadyUnlocked));
-        assert!(!error.to_string().contains(canary));
-        assert!(!format!("{error:?}").contains(canary));
     }
 
     #[test]

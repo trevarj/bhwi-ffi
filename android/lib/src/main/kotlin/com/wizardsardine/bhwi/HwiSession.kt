@@ -98,7 +98,7 @@ class HwiSession private constructor(
     suspend fun promptPin(): Boolean =
         (run(HwiCommand.PromptPin) as? HwiResponse.DeviceAction)?.success ?: unexpected()
 
-    /** Positions 1–9 on a blank keypad; false means authentication rejection. */
+    /** Positions 1–9 on a blank keypad; rejected PINs and authentication cancellation throw AuthRefused. */
     suspend fun sendPin(positions: String): Boolean =
         (run(HwiCommand.SendPin(positions)) as? HwiResponse.DeviceAction)?.success ?: unexpected()
 

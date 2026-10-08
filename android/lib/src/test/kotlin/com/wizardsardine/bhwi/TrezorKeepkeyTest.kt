@@ -201,16 +201,20 @@ class TrezorKeepkeyTest {
     }
 
     @Test
-    fun `PIN false rejection and typed cancellation are not success`() = runBlocking<Unit> {
+    fun `PIN rejection and typed cancellation are authentication errors`() = runBlocking<Unit> {
         for (keepkey in listOf(false, true)) {
-            val steps = if (keepkey) listOf(19 to v1Frame(3, byteArrayOf(8, 7))) else listOf(
-                19 to v1Frame(3, byteArrayOf(8, 7)), 55 to featuresReply(false, "1"),
+            val canary = "pin-device-canary"
+            val failure = v1Frame(3, byteArrayOf(8, 7, 18, canary.length.toByte()) + canary.encodeToByteArray())
+            val steps = if (keepkey) listOf(19 to failure) else listOf(
+                19 to failure, 55 to featuresReply(false, "1"),
             )
             val rejectedChannel = V1ScriptChannel(steps)
             val rejected = session(keepkey, rejectedChannel)
             try {
                 rejected.configurePassphrase(null, false)
-                assertFalse(rejected.sendPin("1234"))
+                val error = assertFailsWith<HwiException.AuthRefused> { rejected.sendPin("1234") }
+                assertFalse(error.toString().contains("1234"))
+                assertFalse(error.toString().contains(canary))
             } finally { rejected.disconnect() }
             rejectedChannel.checkComplete()
             for (code in listOf(4, 6)) {

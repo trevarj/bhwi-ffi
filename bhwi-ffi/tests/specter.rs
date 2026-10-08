@@ -162,7 +162,7 @@ fn unlock_registration_and_descriptor_display_use_actual_specter_dispatch() {
         } else if refusal {
             assert!(matches!(result, Err(HwiError::UserRefused)));
         } else {
-            assert!(result.is_err());
+            assert!(matches!(result, Err(HwiError::InvalidInput { .. })));
         }
     }
     for change in [false, true] {
@@ -291,6 +291,31 @@ fn unsupported_commands_and_name_hmac_network_validation_are_honest() {
         Err(HwiError::InvalidInput { .. })
     ));
     assert!(matches!(interp.end(), Err(HwiError::BadState { .. })));
+}
+
+#[test]
+fn payload_framing_and_device_refusal_categories_are_distinct_and_redacted() {
+    let canary = "specter-error-canary";
+    for (reply, invalid_input) in [
+        (frame(canary.as_bytes()), true),
+        (b"NAK\r\n".to_vec(), false),
+        (
+            frame(format!("error: {canary} User cancelled").as_bytes()),
+            false,
+        ),
+    ] {
+        let interp = Interp::new_specter(Network::Testnet);
+        interp.start(HwiCommand::GetMasterFingerprint).unwrap();
+        let error = interp.exchange(reply).unwrap_err();
+        if invalid_input {
+            assert!(matches!(error, HwiError::InvalidInput { .. }));
+        } else {
+            assert!(matches!(error, HwiError::Device { .. }));
+        }
+        assert!(!error.to_string().contains(canary));
+        assert!(!format!("{error:?}").contains(canary));
+        assert!(matches!(interp.end(), Err(HwiError::BadState { .. })));
+    }
 }
 
 #[test]

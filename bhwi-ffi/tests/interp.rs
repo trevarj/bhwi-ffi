@@ -243,6 +243,24 @@ fn invalid_input_leaves_the_interpreter_usable() {
 }
 
 #[test]
+fn unsupported_bitbox_command_keeps_its_input_category_and_live_lease() {
+    let noise = NoiseHandle::new(None).unwrap();
+    let interp = Interp::new_bitbox(noise.clone(), Network::Testnet).unwrap();
+    assert!(matches!(
+        interp.start(HwiCommand::PromptPin),
+        Err(HwiError::InvalidInput { .. })
+    ));
+    assert!(matches!(noise.export(), Err(HwiError::BadState { .. })));
+    assert!(
+        interp
+            .start(HwiCommand::Unlock {
+                network: Network::Testnet,
+            })
+            .is_ok()
+    );
+}
+
+#[test]
 fn bitbox_unlock_emits_unlock_then_handshake_init() {
     let noise = NoiseHandle::new(None).expect("noise handle");
     let interp = Interp::new_bitbox(noise.clone(), Network::Testnet).expect("interpreter");
@@ -535,18 +553,23 @@ mod trezor_keepkey {
                     positions: "1234".into(),
                 })
                 .unwrap();
-            let next = interp
-                .exchange(frame(MessageType::Failure, &[8, 7]))
-                .unwrap();
-            if keepkey {
-                assert!(next.is_none());
+            let canary = "pin-device-canary";
+            let mut failure = vec![8, 7, 18, canary.len() as u8];
+            failure.extend_from_slice(canary.as_bytes());
+            let reply = interp.exchange(frame(MessageType::Failure, &failure));
+            let error = if keepkey {
+                reply.unwrap_err()
             } else {
-                assert_eq!(next.unwrap().payload, api::get_features());
-                assert!(interp.exchange(features(false)).unwrap().is_none());
-            }
+                assert_eq!(reply.unwrap().unwrap().payload, api::get_features());
+                interp.exchange(features(false)).unwrap_err()
+            };
+            assert!(matches!(error, HwiError::AuthRefused));
+            assert!(!format!("{error:?}").contains("1234"));
+            assert!(!format!("{error:?}").contains(canary));
+            assert!(matches!(interp.end(), Err(HwiError::BadState { .. })));
             assert!(matches!(
-                interp.end().unwrap(),
-                HwiResponse::DeviceAction { success: false }
+                interp.start(HwiCommand::GetVersion),
+                Err(HwiError::BadState { .. })
             ));
         }
     }

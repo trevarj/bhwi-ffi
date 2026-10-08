@@ -17,8 +17,10 @@ import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.bhwi_ffi.AddressFormat
+import uniffi.bhwi_ffi.HwiCommand
 import uniffi.bhwi_ffi.HwiException
 import uniffi.bhwi_ffi.HwiResponse
+import uniffi.bhwi_ffi.Interp
 import uniffi.bhwi_ffi.MultisigAddressFormat
 import uniffi.bhwi_ffi.Network
 import uniffi.bhwi_ffi.SpecterFrameDecoder
@@ -129,6 +131,24 @@ class SpecterTest {
                 // Framing completed: a protocol-level refusal is not stale serial state.
                 assertEquals("f5acc2fd", session.getMasterFingerprint())
             } finally { session.disconnect() }
+        }
+    }
+
+    @Test
+    fun `payload framing and device refusal categories remain distinct and redacted`() {
+        val canary = "specter-error-canary"
+        for ((reply, invalidInput) in listOf(
+            frame(canary) to true,
+            "NAK\r\n".encodeToByteArray() to false,
+            frame("error: $canary User cancelled") to false,
+        )) {
+            Interp.newSpecter(Network.TESTNET).use { interp ->
+                interp.start(HwiCommand.GetMasterFingerprint)
+                val error = if (invalidInput) assertFailsWith<HwiException.InvalidInput> { interp.exchange(reply) }
+                else assertFailsWith<HwiException.Device> { interp.exchange(reply) }
+                assertFalse(error.toString().contains(canary))
+                assertFailsWith<HwiException.BadState> { interp.end() }
+            }
         }
     }
 

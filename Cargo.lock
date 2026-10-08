@@ -150,7 +150,7 @@ checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 [[package]]
 name = "bhwi"
 version = "0.0.1"
-source = "git+https://github.com/trevarj/bhwi?rev=baa7111d6fb76cc0da02c907ddbb75856e4aac8c#baa7111d6fb76cc0da02c907ddbb75856e4aac8c"
+source = "git+https://github.com/wizardsardine/bhwi?rev=580350d258651d5329b8ef5fa1dfa9aa42a8ccb9#580350d258651d5329b8ef5fa1dfa9aa42a8ccb9"
 dependencies = [
  "aes",
  "base64ct",
@@ -181,7 +181,7 @@ dependencies = [
 [[package]]
 name = "bhwi-async"
 version = "0.0.1"
-source = "git+https://github.com/trevarj/bhwi?rev=baa7111d6fb76cc0da02c907ddbb75856e4aac8c#baa7111d6fb76cc0da02c907ddbb75856e4aac8c"
+source = "git+https://github.com/wizardsardine/bhwi?rev=580350d258651d5329b8ef5fa1dfa9aa42a8ccb9#580350d258651d5329b8ef5fa1dfa9aa42a8ccb9"
 dependencies = [
  "async-trait",
  "bhwi",

@@ -9,11 +9,13 @@ use bhwi::common as bc;
 use bhwi::jade::{JadeCommand, JadeInterpreter};
 use bhwi::keepkey::{KeepKeyCommand, KeepKeyInterpreter};
 use bhwi::ledger::{LedgerCommand, LedgerInterpreter};
-use bhwi::specter::{SpecterCommand, SpecterInterpreter};
+use bhwi::specter::{SpecterCommand, SpecterError, SpecterInterpreter};
 use bhwi::trezor::{TrezorCommand, TrezorInterpreter};
 
 use crate::state::{ColdcardEncryption, HostPassphraseHandle, NoiseHandle};
-use crate::types::{DeviceKind, Expect, HwiCommand, HwiResponse, Plan, Transmit, map_error};
+use crate::types::{
+    DeviceKind, Expect, HwiCommand, HwiResponse, Plan, Transmit, map_command_error, map_error,
+};
 use crate::{HwiError, Network};
 
 // Lower once before mutating the session; core requires a family-specific conversion error.
@@ -52,7 +54,7 @@ enum Inner {
     Ledger(LedgerInterpreter<Ready<LedgerCommand>, bc::Transmit, bc::Response, bc::Error>),
     Trezor(TrezorInterpreter<Ready<TrezorCommand>, bc::Transmit, bc::Response, bc::Error>),
     KeepKey(KeepKeyInterpreter<Ready<KeepKeyCommand>, bc::Transmit, bc::Response, bc::Error>),
-    Specter(SpecterInterpreter<Ready<SpecterCommand>, bc::Transmit, bc::Response, bc::Error>),
+    Specter(SpecterInterpreter<Ready<SpecterCommand>, bc::Transmit, bc::Response, SpecterError>),
 }
 
 impl Inner {
@@ -64,7 +66,7 @@ impl Inner {
             Self::Ledger(interpreter) => interpreter.exchange(data),
             Self::Trezor(interpreter) => interpreter.exchange(data),
             Self::KeepKey(interpreter) => interpreter.exchange(data),
-            Self::Specter(interpreter) => interpreter.exchange(data),
+            Self::Specter(interpreter) => interpreter.exchange(data).map_err(specter_error),
         }
     }
 
@@ -76,8 +78,18 @@ impl Inner {
             Self::Ledger(interpreter) => interpreter.end(),
             Self::Trezor(interpreter) => interpreter.end(),
             Self::KeepKey(interpreter) => interpreter.end(),
-            Self::Specter(interpreter) => interpreter.end(),
+            Self::Specter(interpreter) => interpreter.end().map_err(specter_error),
         }
+    }
+}
+
+// Preserve the FFI payload/input distinction before upstream erases it to Serialization.
+fn specter_error(error: SpecterError) -> bc::Error {
+    match error {
+        SpecterError::MalformedPayload(message) => {
+            bc::Error::new(bc::ErrorKind::InvalidInput, message)
+        }
+        error => error.into(),
     }
 }
 
@@ -142,7 +154,7 @@ impl Session {
         macro_rules! start {
             ($interpreter:expr, $command:path) => {{
                 let command = <$command>::try_from(plan.command)
-                    .map_err(|error| map_error(error.into(), self.kind))?;
+                    .map_err(|error| map_command_error(error.into(), self.kind))?;
                 self.started = true;
                 self.expect = plan.expect;
                 self.prior_inputs = prior_inputs;
@@ -156,10 +168,12 @@ impl Session {
             Inner::Jade(interpreter) => start!(interpreter, JadeCommand),
             Inner::Trezor(interpreter) => start!(interpreter, TrezorCommand),
             Inner::KeepKey(interpreter) => start!(interpreter, KeepKeyCommand),
-            Inner::Specter(interpreter) => start!(interpreter, SpecterCommand),
+            Inner::Specter(interpreter) => {
+                start!(interpreter, SpecterCommand).map_err(specter_error)
+            }
             Inner::Ledger(interpreter) => {
                 let command = LedgerCommand::try_from(plan.command)
-                    .map_err(|error| map_error(error.into(), self.kind))?;
+                    .map_err(|error| map_command_error(error.into(), self.kind))?;
                 let registration_id = match &command {
                     LedgerCommand::RegisterWallet { policy } => Some(
                         policy
@@ -467,9 +481,9 @@ impl Interp {
             // SAFETY: `inner.end()` consumed the interpreter and with it the only other
             // reference into the leased engine, and `lease` is still held here.
             let engine = unsafe { &mut *encryption.engine.get_leased() };
-            engine
-                .ready(*key)
-                .map_err(|e| HwiError::Device { msg: e.to_string() })?;
+            engine.ready(*key).map_err(|_| HwiError::Device {
+                msg: "Coldcard: session encryption setup failed".into(),
+            })?;
             drop(lease);
             return Ok(HwiResponse::TaskDone);
         }
@@ -481,7 +495,13 @@ impl Interp {
 
         // An unrelated response is a protocol failure, never an inferred refusal.
         if !expect.matches(&response) {
-            return Err(map_error(bc::Error::NoErrorOrResult, kind));
+            return Err(map_error(
+                bc::Error::new(
+                    bc::ErrorKind::UnexpectedResponse,
+                    "command response mismatch",
+                ),
+                kind,
+            ));
         }
         if let bc::Response::SignedPsbt(psbt) = &response {
             if prior_unsigned_tx != Some(psbt.unsigned_tx.compute_wtxid())

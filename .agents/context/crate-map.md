@@ -17,8 +17,8 @@ Paths below are relative to the repository root. Start with the
 
 These are the two Cargo workspace members: `bhwi-ffi` (cdylib/rlib) and `bindgen`.
 `bhwi-async` is a test dependency for reference framing, not shipped host I/O.
-`Cargo.toml`/`Cargo.lock` pin the core dependencies. Sibling checkouts require the
-README's local override; dependency and local lockfile updates are not validation.
+`Cargo.toml`/`Cargo.lock` pin immutable upstream core dependencies; no sibling
+checkout is required. Dependency and lockfile updates are not validation.
 
 ## Kotlin and Android
 
